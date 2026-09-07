@@ -1,0 +1,10 @@
+target_repo: holeyfield33-art/runtime-firewall-mvp
+model: qwen   # or smol
+train_ratio: 0.7
+val_ratio: 0.15
+max_seq_length: 2048
+lora_r: 16
+lora_alpha: 32
+impact_radius: 2
+max_impact_nodes: 40
+seed: 42

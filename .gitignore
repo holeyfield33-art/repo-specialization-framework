@@ -1,0 +1,9 @@
+results/data/
+results/file_packs/
+results/adapters/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+*.egg-info/
+.DS_Store
