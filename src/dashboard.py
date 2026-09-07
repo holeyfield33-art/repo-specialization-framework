@@ -1,0 +1,172 @@
+"""
+11. Lightweight local dashboard (Streamlit + optional static HTML).
+Compares base vs tuned, RAG vs packs, packs vs packs+graph.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>RSEF Experiment Dashboard — runtime-firewall-mvp</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; background: #0f1419; color: #e7e9ea; }
+  h1, h2 { color: #1d9bf0; }
+  .card { background: #1a2332; border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; border: 1px solid #2f3336; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #2f3336; }
+  th { color: #8b98a5; font-weight: 600; }
+  .pass { color: #00ba7c; }
+  .fail { color: #f4212e; }
+  .mono { font-family: ui-monospace, monospace; font-size: 0.9em; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>Repository Specialization Experiment</h1>
+<p class="mono">Target: holeyfield33-art/runtime-firewall-mvp · Framework v0.1.0</p>
+<p>Falsifiable question: Does repo-specific QLoRA + structured file packs + graph neighborhood
+outperform the same untuned small model with ordinary repo-wide context?</p>
+
+<div class="card">
+  <h2>Condition Summary</h2>
+  <div id="bar"></div>
+  <table id="summary-table">
+    <thead><tr>
+      <th>Condition</th><th>Success</th><th>Impact Recall</th><th>Halluc. APIs</th>
+      <th>Tokens</th><th>Latency (ms)</th><th>Label</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Contamination Audit</h2>
+  <pre id="contam" class="mono"></pre>
+</div>
+
+<div class="card">
+  <h2>Verification Gate (sample)</h2>
+  <pre id="gate" class="mono"></pre>
+</div>
+
+<div class="card">
+  <h2>Failure / Success Examples (side-by-side)</h2>
+  <div class="grid" id="examples"></div>
+</div>
+
+<script>
+const DATA = __DATA_JSON__;
+
+const tbody = document.querySelector("#summary-table tbody");
+const conds = ["A","B","C","D"];
+const successRates = [];
+conds.forEach(c => {
+  const s = DATA.summary[c] || {};
+  successRates.push(s.task_success_rate || 0);
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td><b>${c}</b></td>
+    <td>${((s.task_success_rate||0)*100).toFixed(1)}%</td>
+    <td>${((s.mean_impacted_file_recall||0)*100).toFixed(1)}%</td>
+    <td>${(s.mean_hallucinated_apis||0).toFixed(2)}</td>
+    <td>${Math.round(s.mean_token_usage||0)}</td>
+    <td>${Math.round(s.mean_latency_ms||0)}</td>
+    <td>${s.condition_label||""}</td>`;
+  tbody.appendChild(tr);
+});
+
+Plotly.newPlot("bar", [{
+  x: conds.map(c => c + ": " + (DATA.summary[c]?.condition_label||"").slice(0,40)),
+  y: successRates.map(v => v*100),
+  type: "bar",
+  marker: { color: ["#f4212e","#ff7a00","#1d9bf0","#00ba7c"] }
+}], {
+  paper_bgcolor: "#1a2332", plot_bgcolor: "#1a2332",
+  font: { color: "#e7e9ea" },
+  yaxis: { title: "Task success %", range: [0,100] },
+  margin: { t: 30 }
+});
+
+document.getElementById("contam").textContent = JSON.stringify(DATA.contamination, null, 2);
+document.getElementById("gate").textContent = JSON.stringify(DATA.sample_gate, null, 2);
+
+const ex = document.getElementById("examples");
+(DATA.examples || []).forEach(pair => {
+  const div = document.createElement("div");
+  div.innerHTML = `<h3 class="mono">${pair.task_id}</h3>
+    <p><b>A (base RAG)</b>: ${pair.A}</p>
+    <p><b>D (tuned+packs+graph)</b>: ${pair.D}</p>`;
+  ex.appendChild(div);
+});
+</script>
+</body>
+</html>
+"""
+
+
+def build_dashboard(
+    summary: Dict[str, Any],
+    contamination: Dict[str, Any],
+    sample_gate: Dict[str, Any],
+    examples: List[Dict[str, str]],
+    out_path: Path,
+) -> Path:
+    payload = {
+        "summary": summary,
+        "contamination": contamination,
+        "sample_gate": sample_gate,
+        "examples": examples,
+    }
+    html = DASHBOARD_HTML.replace("__DATA_JSON__", json.dumps(payload))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
+
+
+def write_streamlit_app(out_path: Path) -> None:
+    code = '''
+import json
+from pathlib import Path
+import streamlit as st
+import pandas as pd
+
+st.set_page_config(page_title="RSEF Dashboard", layout="wide")
+st.title("Repository Specialization Experiment")
+st.caption("Target: runtime-firewall-mvp · Qwen2.5-Coder-1.5B / SmolLM3-3B")
+
+results_dir = Path("results")
+summary_path = results_dir / "summary.json"
+if not summary_path.exists():
+    st.warning("Run the experiment first (python -m scripts.run_experiment)")
+    st.stop()
+
+summary = json.loads(summary_path.read_text())
+contam = json.loads((results_dir / "contamination_report.json").read_text())
+
+st.subheader("Conditions")
+rows = []
+for c, s in summary.items():
+    rows.append({
+        "Condition": c,
+        "Success %": round(100 * s.get("task_success_rate", 0), 1),
+        "Impact Recall %": round(100 * s.get("mean_impacted_file_recall", 0), 1),
+        "Halluc. APIs": round(s.get("mean_hallucinated_apis", 0), 2),
+        "Tokens": int(s.get("mean_token_usage", 0)),
+        "Latency ms": int(s.get("mean_latency_ms", 0)),
+        "Label": s.get("condition_label", ""),
+    })
+st.dataframe(pd.DataFrame(rows), use_container_width=True)
+st.bar_chart(pd.DataFrame(rows).set_index("Condition")["Success %"])
+
+st.subheader("Contamination Audit")
+st.json(contam)
+st.success("Audit status: " + contam.get("status", "?"))
+'''
+    out_path.write_text(code, encoding="utf-8")
