@@ -7,13 +7,13 @@ Impact neighborhood for changed files; unresolved boundaries recorded as uncerta
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import networkx as nx
 
-from .ingestion import FileRecord, RepoManifest, compute_sha256
+from .ingestion import RepoManifest
 
 
 EDGE_TYPES = (

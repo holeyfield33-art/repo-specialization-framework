@@ -41,6 +41,7 @@ outperform the same untuned small model with ordinary repo-wide context?</p>
   <table id="summary-table">
     <thead><tr>
       <th>Condition</th><th>Success</th><th>Impact Recall</th><th>Halluc. APIs</th>
+      <th>Test pass</th><th>Unnecessary edits</th><th>Security regressions</th>
       <th>Tokens</th><th>Latency (ms)</th><th>Label</th>
     </tr></thead>
     <tbody></tbody>
@@ -76,6 +77,9 @@ conds.forEach(c => {
     <td>${((s.task_success_rate||0)*100).toFixed(1)}%</td>
     <td>${((s.mean_impacted_file_recall||0)*100).toFixed(1)}%</td>
     <td>${(s.mean_hallucinated_apis||0).toFixed(2)}</td>
+    <td>${s.test_pass_rate == null ? "n/a" : (s.test_pass_rate*100).toFixed(1)+"%"}</td>
+    <td>${(s.mean_unnecessary_edits||0).toFixed(2)}</td>
+    <td>${s.security_invariant_regressions||0}</td>
     <td>${Math.round(s.mean_token_usage||0)}</td>
     <td>${Math.round(s.mean_latency_ms||0)}</td>
     <td>${s.condition_label||""}</td>`;
@@ -141,7 +145,7 @@ st.set_page_config(page_title="RSEF Dashboard", layout="wide")
 st.title("Repository Specialization Experiment")
 st.caption("Target: runtime-firewall-mvp · Qwen2.5-Coder-1.5B / SmolLM3-3B")
 
-results_dir = Path("results")
+results_dir = Path(__file__).resolve().parent
 summary_path = results_dir / "summary.json"
 if not summary_path.exists():
     st.warning("Run the experiment first (python -m scripts.run_experiment)")
@@ -158,6 +162,9 @@ for c, s in summary.items():
         "Success %": round(100 * s.get("task_success_rate", 0), 1),
         "Impact Recall %": round(100 * s.get("mean_impacted_file_recall", 0), 1),
         "Halluc. APIs": round(s.get("mean_hallucinated_apis", 0), 2),
+        "Test pass %": None if s.get("test_pass_rate") is None else round(100 * s["test_pass_rate"], 1),
+        "Unnecessary edits": round(s.get("mean_unnecessary_edits", 0), 2),
+        "Security regressions": int(s.get("security_invariant_regressions", 0)),
         "Tokens": int(s.get("mean_token_usage", 0)),
         "Latency ms": int(s.get("mean_latency_ms", 0)),
         "Label": s.get("condition_label", ""),

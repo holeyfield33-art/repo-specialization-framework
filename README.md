@@ -37,42 +37,89 @@ Any 0.5B–3B instruction-tuned causal LM can be added via `QLoRAHyperParams.for
 11. **Dashboard** — static HTML + optional Streamlit.
 12. **Artifacts** — manifest, packs, graph, splits, contamination report, QLoRA config, adapter dir, results, dashboard.
 
-## Quick start
+## Integrity guarantees
+
+- The complete reachable Git history is ingested; history is never silently depth-capped.
+- The change family remains the split unit and the existing temporal 70/15/15 split is preserved.
+- Every evaluation task is tied to a real held-out commit and reads source from that commit's parent snapshot.
+- Synthetic/current-HEAD examples are excluded because they cannot be proven earlier than held-out work.
+- The contamination audit runs before model loading or training and blocks the run on failure.
+- CUDA is mandatory for measured runs. There is no simulator, CPU score fallback, or adapter placeholder.
+- Conditions A and B finish and are saved before QLoRA training. Conditions C and D load the saved adapter.
+- Patch tasks are applied in disposable Git worktrees and the configured repository test command is executed.
+- Invalid model JSON is retained as raw task output and scored as a real failure; it is never replaced with invented output.
+
+## Colab: first real run
 
 ```bash
-# from repo root
+# Colab terminal/cell commands. Use full clones; do not add --depth.
+cd /content
+git clone https://github.com/holeyfield33-art/repo-specialization-framework.git
+git clone https://github.com/holeyfield33-art/runtime-firewall-mvp.git
+
+cd /content/repo-specialization-framework
 pip install -r requirements.txt
 
-# run against the extracted Helios sample (or a full clone)
+# Patch verification reuses this dependency installation in disposable worktrees.
+cd /content/runtime-firewall-mvp
+npm ci --ignore-scripts
+
+cd /content/repo-specialization-framework
+
+# First inspect and freeze the full-history data, counts, splits, and audit.
 python -m scripts.run_experiment \
-  --repo ../helios-sample \
+  --repo /content/runtime-firewall-mvp \
   --model qwen \
-  --out results/
+  --out /content/rsef-results/qwen \
+  --prepare-only
 
-# view dashboard
-open results/dashboard.html   # or xdg-open / browser
-
-# optional Streamlit
-streamlit run results/streamlit_app.py
+# Then run real A/B, QLoRA training, and real C/D with the same prepared data.
+python -m scripts.run_experiment \
+  --repo /content/runtime-firewall-mvp \
+  --model qwen \
+  --out /content/rsef-results/qwen \
+  --prepared-data /content/rsef-results/qwen/data
 ```
 
-### Full clone of the target (optional)
+The runner prints and exports GPU model, VRAM, CUDA and PyTorch versions before inference/training. The pretraining report prints source files, graph edges, independent families, train/validation/evaluation family and task counts, and contamination status.
+
+The committed QLoRA configuration uses `bfloat16`, as specified by the original harness. The runner stops rather than silently switching precision when the assigned GPU lacks BF16 support. Changing that setting requires explicit approval because it changes a training hyperparameter.
+
+### Second small model, unchanged data
 
 ```bash
-git clone --depth 50 https://github.com/holeyfield33-art/runtime-firewall-mvp.git /tmp/runtime-firewall-mvp
-python -m scripts.run_experiment --repo /tmp/runtime-firewall-mvp --out results/full/
+python -m scripts.run_experiment \
+  --repo /content/runtime-firewall-mvp \
+  --model smol \
+  --out /content/rsef-results/smol \
+  --prepared-data /content/rsef-results/qwen/data
 ```
 
-### Real QLoRA (requires GPU + peft/bitsandbytes)
+This reuses the Qwen run's frozen manifest and exact train/validation/evaluation JSONL files. The runner aborts if the target repository HEAD differs.
 
-```bash
-python results/train_qlora.py \
-  --config results/qlora_config.yaml \
-  --train_jsonl results/data/splits/train.jsonl \
-  --val_jsonl results/data/splits/val.jsonl
-```
+### Artifacts
 
-On CPU-only environments the runner writes an adapter placeholder and simulates condition scores so the full evaluation + contamination + dashboard path can still be exercised.
+Each model directory contains:
+
+- `hardware.json`
+- `data/pretraining_report.json`
+- `data/contamination_report.json`
+- `data/repository_manifest.json`
+- `data/dependency_graph.json`
+- `data/dataset_lock.json` (SHA-256 lock reused by the second model)
+- `data/splits/{train,val,eval}.jsonl`
+- `qlora_config.yaml`
+- `adapters/<model>-repo-qlora/adapter_config.json`
+- `adapters/<model>-repo-qlora/adapter_model.safetensors`
+- `task_results_ab.json` (saved before training)
+- `task_results_abcd.json`
+- `metrics.json`
+- `verification_gate.json`
+- `experiment_index.json`
+- `dashboard.html` and `streamlit_app.py`
+- `report.md`
+
+Do not interpret partial directories as completed experiments. A completed run must have a `PASS` verification gate and all four non-empty condition result arrays.
 
 ## Layout
 
@@ -87,7 +134,8 @@ repo-specialization-framework/
 │   ├── evaluation.py     # §7–10
 │   └── dashboard.py      # §11
 ├── scripts/
-│   └── run_experiment.py # end-to-end
+│   ├── train_qlora.py    # real CUDA QLoRA training
+│   └── run_experiment.py # fail-closed end-to-end runner
 ├── configs/
 ├── data/                 # intermediate (created at runtime)
 ├── results/              # all output artifacts

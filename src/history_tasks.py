@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from .ingestion import ChangeFamily, RepoManifest
 from .graph import DependencyGraph
@@ -34,6 +34,11 @@ class TaskExample:
     evidence: List[str]  # provenance strings
     split: str = "train"  # train | val | eval
     difficulty: str = "medium"
+    # Every task is evaluated against the repository state immediately before
+    # its change family.  This prevents current-HEAD source from revealing a
+    # held-out fix.
+    context_commit: Optional[str] = None
+    temporal_rank: Optional[int] = None
 
 
 TASK_TYPES = [
@@ -48,7 +53,7 @@ TASK_TYPES = [
 ]
 
 
-def _family_temporal_split(
+def family_temporal_split(
     families: List[ChangeFamily],
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
@@ -84,18 +89,24 @@ def generate_tasks_from_history(
     seed: int = 42,
 ) -> List[TaskExample]:
     random.seed(seed)
-    assignment = _family_temporal_split(manifest.change_families)
+    assignment = family_temporal_split(manifest.change_families)
     tasks: List[TaskExample] = []
-    path_set = {f.path for f in manifest.files}
-    family_by_id = {f.family_id: f for f in manifest.change_families}
+    commit_by_sha = {c.sha: c for c in manifest.commits}
 
     for fam in manifest.change_families:
         split = assignment.get(fam.family_id, "train")
-        changed = [p for p in fam.files if p in path_set]
+        changed = [p for p in fam.files if Path(p).suffix.lower() in {
+            ".js", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".go", ".rs", ".java",
+            ".md", ".json", ".yml", ".yaml",
+        }]
         if not changed:
             continue
-        neigh = graph.impact_neighborhood(changed, radius=1, max_nodes=15)
-        related = list(set(neigh["nodes"]) - set(changed))
+        commit = commit_by_sha.get(fam.root_commit)
+        context_commit = commit.parents[0] if commit and commit.parents else None
+        seeds = changed[:1]
+        # Ground truth comes from the real historical change, not from the
+        # current-HEAD graph.  The graph is context only.
+        related = changed[1:]
 
         tasks.append(
             TaskExample(
@@ -106,25 +117,58 @@ def generate_tasks_from_history(
                 instruction=(
                     f"Given the following changed files in commit {fam.root_commit[:12]}, "
                     f"list the files most likely to be impacted (callers, callees, tests). "
-                    f"Changed: {changed[:5]}. Use only repository structure evidence."
+                    f"Known starting file: {seeds}. Use only repository evidence."
                 ),
-                context_files=changed + related[:8],
+                context_files=seeds,
                 ground_truth={
                     "impacted": related[:10],
-                    "seeds": changed,
-                    "uncertainty": neigh.get("uncertainty", []),
+                    "seeds": seeds,
                 },
                 evidence=[f"graph:{graph.version}", f"commit:{fam.root_commit}"],
                 split=split,
+                context_commit=context_commit,
+                temporal_rank=fam.temporal_rank,
             )
         )
 
+        if context_commit:
+            try:
+                import git
+                repo = git.Repo(manifest.root_path)
+                historical_patch = repo.git.diff(
+                    context_commit, fam.root_commit, "--", *changed[:3]
+                )
+            except Exception:
+                historical_patch = ""
+            if historical_patch:
+                tasks.append(
+                    TaskExample(
+                        task_id=f"{fam.family_id}-patch",
+                        task_type="patch_generation",
+                        family_id=fam.family_id,
+                        commit_sha=fam.root_commit,
+                        instruction=(
+                            f"Reproduce the change described by commit message {commit.message[:180]!r}. "
+                            "Return a unified diff based only on the pre-change repository context."
+                        ),
+                        context_files=seeds,
+                        ground_truth={
+                            "files": changed[:3],
+                            "seeds": seeds,
+                            "patch": historical_patch,
+                        },
+                        evidence=[f"parent:{context_commit}", f"commit:{fam.root_commit}"],
+                        split=split,
+                        difficulty="hard",
+                        context_commit=context_commit,
+                        temporal_rank=fam.temporal_rank,
+                    )
+                )
+
         tests = []
-        for p in changed:
-            for fr in manifest.files:
-                if fr.path == p:
-                    tests.extend(fr.related_tests)
+        tests.extend(p for p in changed if "test" in p.lower() or "spec" in p.lower())
         tests = list(dict.fromkeys(tests))
+        source_changes = [p for p in changed if p not in tests]
         tasks.append(
             TaskExample(
                 task_id=f"{fam.family_id}-test-impact",
@@ -132,13 +176,15 @@ def generate_tasks_from_history(
                 family_id=fam.family_id,
                 commit_sha=fam.root_commit,
                 instruction=(
-                    f"Which tests should be re-run after changes to {changed[:3]}? "
+                    f"Which tests should be re-run after changes to {source_changes[:3]}? "
                     "Answer with paths only; justify from TEST edges."
                 ),
-                context_files=changed + tests[:5],
+                context_files=source_changes[:3],
                 ground_truth={"tests_to_run": tests},
                 evidence=[f"test-heuristic:{t}" for t in tests[:5]],
                 split=split,
+                context_commit=context_commit,
+                temporal_rank=fam.temporal_rank,
             )
         )
 
@@ -150,16 +196,17 @@ def generate_tasks_from_history(
                     family_id=fam.family_id,
                     commit_sha=fam.root_commit,
                     instruction=(
-                        f"Explain the dependency relationship between {changed[0]} and "
-                        f"{related[0] if related else 'related modules'}. "
-                        "Cite edge types (IMPORTS/CALLS/TESTS)."
+                        f"Identify and explain modules related to {changed[0]}. "
+                        "Cite repository evidence and edge types when available."
                     ),
-                    context_files=[changed[0]] + (related[:3] if related else []),
+                    context_files=[changed[0]],
                     ground_truth={
-                        "edges": [e for e in neigh["edges"] if e["src"] in changed or e["dst"] in changed][:10],
+                        "related_files": related[:10],
                     },
-                    evidence=[f"graph-edge:{e}" for e in neigh["edges"][:3]],
+                    evidence=[f"commit-cochange:{fam.root_commit}"],
                     split=split,
+                    context_commit=context_commit,
+                    temporal_rank=fam.temporal_rank,
                 )
             )
 
@@ -178,14 +225,17 @@ def generate_tasks_from_history(
                     f"Perform a code review of the change family rooted at {fam.root_commit[:12]}. "
                     f"Commit message: {msg[:200]}. List risks, missing tests, and invariant concerns."
                 ),
-                context_files=changed[:6],
+                context_files=seeds,
                 ground_truth={
                     "commit_message": msg,
                     "files": changed,
+                    "seeds": seeds,
                     "suggested_checks": ["policy integrity", "self-hash", "detection coverage"],
                 },
                 evidence=[f"commit:{fam.root_commit}", f"message:{msg[:80]}"],
                 split=split,
+                context_commit=context_commit,
+                temporal_rank=fam.temporal_rank,
             )
         )
 
@@ -200,58 +250,19 @@ def generate_tasks_from_history(
                         f"Localize the bug addressed by commit {fam.root_commit[:12]}. "
                         f"Message: {msg[:180]}. Name the primary file and symbol if possible."
                     ),
-                    context_files=changed[:5],
+                    context_files=[],
                     ground_truth={"primary_files": changed[:2], "message": msg},
                     evidence=[f"commit:{fam.root_commit}"],
                     split=split,
                     difficulty="hard",
+                    context_commit=context_commit,
+                    temporal_rank=fam.temporal_rank,
                 )
             )
 
-    for i, fr in enumerate(manifest.files):
-        if fr.related_tests and fr.language == "javascript":
-            split = "eval" if i % 4 == 0 else ("val" if i % 5 == 0 else "train")
-            tasks.append(
-                TaskExample(
-                    task_id=f"synth-utgen-{fr.path.replace('/', '_')}",
-                    task_type="unit_test_generation",
-                    family_id="synthetic-validated",
-                    commit_sha=manifest.head_sha or "head",
-                    instruction=(
-                        f"Generate a unit test outline for the module at {fr.path}. "
-                        f"Focus on exported symbols: {fr.symbols[:5]}."
-                    ),
-                    context_files=[fr.path],
-                    ground_truth={"existing_tests": fr.related_tests, "symbols": fr.symbols},
-                    evidence=[f"existing-test:{t}" for t in fr.related_tests],
-                    split=split,
-                    difficulty="easy",
-                )
-            )
-
-    if len(manifest.change_families) <= 2:
-        js_files = [f.path for f in manifest.files if f.language == "javascript"]
-        for i, path in enumerate(js_files[:6]):
-            neigh = graph.impact_neighborhood([path], radius=1, max_nodes=10)
-            related = [n for n in neigh["nodes"] if n != path]
-            tasks.append(
-                TaskExample(
-                    task_id=f"heldout-impact-{i}-{Path(path).stem}",
-                    task_type="change_impact_prediction",
-                    family_id=f"heldout-family-{i}",
-                    commit_sha=f"heldout-{i}",
-                    instruction=(
-                        f"Predict impact neighborhood for a hypothetical change to {path}. "
-                        "List likely callers, callees, and tests."
-                    ),
-                    context_files=[path] + related[:5],
-                    ground_truth={"impacted": related, "seeds": [path]},
-                    evidence=[f"graph:{graph.version}"],
-                    split="eval",
-                    difficulty="medium",
-                )
-            )
-
+    # Synthetic HEAD-derived examples are deliberately excluded.  They cannot
+    # be proven temporally earlier than held-out real commits, and the experiment
+    # contract requires every evaluation task to belong to a real change family.
     return tasks
 
 

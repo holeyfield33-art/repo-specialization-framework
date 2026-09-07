@@ -7,11 +7,14 @@ fields that MUST carry provenance. Never treat LLM summaries as authoritative.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from .ingestion import FileRecord, RepoManifest, compute_sha256
+
+if TYPE_CHECKING:
+    from .graph import DependencyGraph
 
 
 @dataclass

@@ -1,192 +1,255 @@
 #!/usr/bin/env python3
-"""
-End-to-end experimental harness for repository specialization.
-
-Usage:
-  python -m scripts.run_experiment --repo /path/to/runtime-firewall-mvp \\
-      --model qwen --out results/
-
-Produces all required artifacts:
-  repository manifest, file packs, dependency graph,
-  train/val/eval manifests, contamination report,
-  QLoRA config, (adapter placeholder), evaluation results, dashboard.
-"""
+"""Run a fail-closed, real RSEF specialization experiment."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
-# ensure package root on path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.ingestion import ingest_repository, save_manifest, manifest_to_dict
-from src.graph import build_dependency_graph
-from src.file_packs import generate_file_packs
-from src.history_tasks import generate_tasks_from_history, write_splits
-from src.qlora_config import QLoRAHyperParams, TRAIN_SCRIPT
-from src.evaluation import (
-    run_all_conditions,
-    contamination_audit,
-    aggregate_metrics,
-    deterministic_verify,
-    CONDITIONS,
-)
 from src.dashboard import build_dashboard, write_streamlit_app
+from src.evaluation import aggregate_metrics, contamination_audit, run_condition_group
+from src.file_packs import generate_file_packs
+from src.graph import build_dependency_graph
+from src.history_tasks import (
+    TaskExample,
+    family_temporal_split,
+    generate_tasks_from_history,
+    write_splits,
+)
+from src.ingestion import ingest_repository, save_manifest
+from src.ingestion import compute_sha256
+from src.model_runtime import require_cuda
+from src.qlora_config import QLoRAHyperParams
+
+
+def _read_tasks(path: Path) -> list[TaskExample]:
+    return [TaskExample(**json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _git_head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def _write_dataset_lock(data_dir: Path, head_sha: str) -> None:
+    relative_paths = [
+        "repository_manifest.json", "dependency_graph.json",
+        "splits/train.jsonl", "splits/val.jsonl", "splits/eval.jsonl",
+        "splits/split_manifest.json", "contamination_report.json", "pretraining_report.json",
+    ]
+    lock = {
+        "target_head": head_sha,
+        "sha256": {rel: compute_sha256((data_dir / rel).read_bytes()) for rel in relative_paths},
+    }
+    (data_dir / "dataset_lock.json").write_text(json.dumps(lock, indent=2))
+
+
+def _verify_dataset_lock(data_dir: Path) -> dict:
+    lock = json.loads((data_dir / "dataset_lock.json").read_text())
+    mismatches = []
+    for rel, expected in lock.get("sha256", {}).items():
+        path = data_dir / rel
+        actual = compute_sha256(path.read_bytes()) if path.is_file() else None
+        if actual != expected:
+            mismatches.append({"path": rel, "expected": expected, "actual": actual})
+    if mismatches:
+        raise SystemExit("prepared dataset lock failed: " + json.dumps(mismatches[:5]))
+    return lock
+
+
+def prepare(repo: Path, data_dir: Path, packs_dir: Path) -> tuple[list[TaskExample], dict]:
+    print("=== PRE-TRAINING: full-history ingestion ===", flush=True)
+    manifest = ingest_repository(repo, repo_name="holeyfield33-art/runtime-firewall-mvp", include_content=True)
+    save_manifest(manifest, data_dir / "repository_manifest.json")
+    graph = build_dependency_graph(manifest)
+    graph.save(data_dir / "dependency_graph.json")
+    generate_file_packs(manifest, graph, packs_dir)
+    tasks = generate_tasks_from_history(manifest, graph)
+    write_splits(tasks, data_dir / "splits")
+    train = [t for t in tasks if t.split == "train"]
+    val = [t for t in tasks if t.split == "val"]
+    evaluation = [t for t in tasks if t.split == "eval"]
+    family_assignments = family_temporal_split(manifest.change_families)
+    report = contamination_audit(
+        train, evaluation, {t.family_id for t in train}, {t.family_id for t in evaluation},
+    )
+    (data_dir / "contamination_report.json").write_text(json.dumps(report, indent=2))
+    counts = {
+        "source_file_count": len(manifest.files),
+        "graph_edge_count": len(graph.edges),
+        "independent_change_family_count": len(manifest.change_families),
+        "train_family_count": sum(s == "train" for s in family_assignments.values()),
+        "val_family_count": sum(s == "val" for s in family_assignments.values()),
+        "eval_family_count": sum(s == "eval" for s in family_assignments.values()),
+        "train_task_count": len(train),
+        "val_task_count": len(val),
+        "eval_task_count": len(evaluation),
+        "contamination_audit": report["status"],
+    }
+    (data_dir / "pretraining_report.json").write_text(json.dumps(counts, indent=2))
+    _write_dataset_lock(data_dir, manifest.head_sha or "")
+    print(json.dumps(counts, indent=2), flush=True)
+    if report["status"] != "PASS":
+        raise SystemExit("contamination audit failed; training is blocked")
+    return tasks, counts
+
+
+def load_prepared(repo: Path, prepared_data: Path) -> tuple[list[TaskExample], dict]:
+    lock = _verify_dataset_lock(prepared_data)
+    manifest = json.loads((prepared_data / "repository_manifest.json").read_text())
+    if manifest["head_sha"] != _git_head(repo) or lock.get("target_head") != manifest["head_sha"]:
+        raise SystemExit("target HEAD differs from frozen prepared dataset")
+    tasks = []
+    for split in ("train", "val", "eval"):
+        tasks.extend(_read_tasks(prepared_data / "splits" / f"{split}.jsonl"))
+    report = json.loads((prepared_data / "contamination_report.json").read_text())
+    if report.get("status") != "PASS":
+        raise SystemExit("prepared contamination report is not PASS")
+    return tasks, json.loads((prepared_data / "pretraining_report.json").read_text())
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RSEF experiment runner")
-    parser.add_argument(
-        "--repo",
-        type=str,
-        default=str(ROOT.parent / "helios-sample"),
-        help="Path to local clone or sample of runtime-firewall-mvp",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--model", choices=["qwen", "smol"], default="qwen")
-    parser.add_argument("--out", type=str, default=str(ROOT / "results"))
-    parser.add_argument("--dry-train", action="store_true", default=True)
+    parser.add_argument("--out", type=Path, default=ROOT / "results" / "qwen")
+    parser.add_argument("--prepared-data", type=Path)
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--test-command", default="npm test")
     args = parser.parse_args()
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    repo = args.repo.resolve()
+    if not (repo / ".git").exists():
+        raise SystemExit(f"full Git clone required: {repo}")
+    out = args.out.resolve()
     data_dir = out / "data"
     packs_dir = out / "file_packs"
-    data_dir.mkdir(exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=== 1. Repository ingestion ===")
-    repo_path = Path(args.repo)
-    if not repo_path.exists():
-        repo_path = ROOT.parent / "helios-sample"
-    manifest = ingest_repository(
-        repo_path,
-        repo_name="holeyfield33-art/runtime-firewall-mvp",
-        include_content=True,
-    )
-    save_manifest(manifest, data_dir / "repository_manifest.json")
-    print(f"  files={len(manifest.files)} commits={len(manifest.commits)} "
-          f"families={len(manifest.change_families)} graph_version={manifest.graph_version}")
+    if args.prepared_data:
+        tasks, counts = load_prepared(repo, args.prepared_data.resolve())
+        if data_dir != args.prepared_data.resolve():
+            shutil.copytree(args.prepared_data.resolve(), data_dir, dirs_exist_ok=True)
+    else:
+        tasks, counts = prepare(repo, data_dir, packs_dir)
+    if args.prepare_only:
+        print("Preparation complete; no training or inference was run.")
+        return
 
-    print("=== 2-3. Dependency graph + file packs ===")
-    graph = build_dependency_graph(manifest)
-    graph.save(data_dir / "dependency_graph.json")
-    packs = generate_file_packs(manifest, graph, packs_dir)
-    print(f"  nodes={graph.g.number_of_nodes()} edges={len(graph.edges)} packs={len(packs)}")
+    hardware = require_cuda()
+    (out / "hardware.json").write_text(json.dumps(hardware, indent=2))
+    print("=== GPU/CUDA ===", flush=True)
+    print(json.dumps(hardware, indent=2), flush=True)
 
-    print("=== 4-5. Historical tasks & temporal splits ===")
-    tasks = generate_tasks_from_history(manifest, graph)
-    split_paths = write_splits(tasks, data_dir / "splits")
-    train_tasks = [t for t in tasks if t.split == "train"]
-    val_tasks = [t for t in tasks if t.split == "val"]
-    eval_tasks = [t for t in tasks if t.split == "eval"]
-    print(f"  train={len(train_tasks)} val={len(val_tasks)} eval={len(eval_tasks)}")
-
-    print("=== 6. QLoRA config ===")
     hp = QLoRAHyperParams.for_model(args.model)
     hp.output_dir = str(out / "adapters" / f"{args.model}-repo-qlora")
     hp.save(out / "qlora_config.yaml")
-    (out / "train_qlora.py").write_text(TRAIN_SCRIPT)
-    adapter_marker = Path(hp.output_dir)
-    adapter_marker.mkdir(parents=True, exist_ok=True)
-    (adapter_marker / "ADAPTER_PLACEHOLDER.txt").write_text(
-        "Adapter weights would be written here after GPU QLoRA training.\n"
-        "Facts remain in file packs + graph; adapter learns conventions/patterns only.\n"
-        f"Config: {args.model} r={hp.lora_r} alpha={hp.lora_alpha} seq={hp.max_seq_length}\n"
+    adapter = Path(hp.output_dir)
+    eval_tasks = [t for t in tasks if t.split == "eval"]
+    if any(t.task_type == "patch_generation" for t in eval_tasks) and not (repo / "node_modules").is_dir():
+        raise SystemExit("target node_modules missing; run 'npm ci --ignore-scripts' before patch evaluation")
+    if hp.bnb_4bit_compute_dtype == "bfloat16":
+        import torch
+        if not torch.cuda.is_bf16_supported():
+            raise SystemExit(
+                "the frozen bfloat16 compute setting is unsupported by this GPU; "
+                "stopping before changing hyperparameters"
+            )
+
+    print("=== REAL CONDITIONS A/B (UNTUNED) ===", flush=True)
+    results = run_condition_group(
+        eval_tasks, ["A", "B"], repo, hp.model_name_or_path,
+        max_input_tokens=hp.max_seq_length, test_command=args.test_command,
+        checkpoint_dir=out / "task_checkpoints",
     )
-    print(f"  model={hp.model_name_or_path} effective_batch={hp.effective_batch_size()}")
+    (out / "task_results_ab.json").write_text(json.dumps(
+        {condition: [asdict(row) for row in rows] for condition, rows in results.items()}, indent=2,
+    ))
 
-    print("=== 7-8. Evaluation (4 conditions) ===")
-    results_by_cond = run_all_conditions(eval_tasks, packs_dir, graph, adapter_marker)
-    summary = aggregate_metrics(results_by_cond)
-    with open(out / "summary.json", "w") as fh:
-        json.dump(summary, fh, indent=2)
-    with open(out / "metrics_raw.json", "w") as fh:
-        json.dump(
-            {c: [r.__dict__ for r in rows] for c, rows in results_by_cond.items()},
-            fh,
-            indent=2,
-        )
-    for c, s in summary.items():
-        print(f"  {c}: success={s.get('task_success_rate', 0):.1%} "
-              f"recall={s.get('mean_impacted_file_recall', 0):.1%} "
-              f"| {s.get('condition_label', '')[:50]}")
+    print("=== REAL QLoRA TRAINING ===", flush=True)
+    subprocess.run([
+        sys.executable, str(ROOT / "scripts" / "train_qlora.py"),
+        "--config", str(out / "qlora_config.yaml"),
+        "--train-jsonl", str(data_dir / "splits" / "train.jsonl"),
+        "--val-jsonl", str(data_dir / "splits" / "val.jsonl"),
+    ], check=True)
+    adapter_config = adapter / "adapter_config.json"
+    adapter_weights = adapter / "adapter_model.safetensors"
+    if not adapter_config.is_file() or not adapter_weights.is_file():
+        raise SystemExit("adapter training did not produce real safetensors weights/config")
 
-    print("=== 9. Deterministic verification gate ===")
-    sample_pack = packs[0] if packs else None
-    gate = deterministic_verify(
-        pack_sha=sample_pack.pack_sha if sample_pack else "",
-        expected_source_sha=sample_pack.source_sha if sample_pack else "",
-        graph_version=graph.version,
-        expected_graph_version=manifest.graph_version,
-        tests_run=["aho-corasick-unit-test.js", "detector-unit-test.js"],
-        required_tests=["aho-corasick-unit-test.js"],
-        patch_clean=True,
-        static_ok=True,
-        critical_violations=0,
-    )
-    with open(out / "verification_gate.json", "w") as fh:
-        json.dump(gate.__dict__, fh, indent=2)
-    print(f"  gate status = {gate.status}")
+    print("=== REAL CONDITIONS C/D (TUNED) ===", flush=True)
+    results.update(run_condition_group(
+        eval_tasks, ["C", "D"], repo, hp.model_name_or_path, adapter,
+        max_input_tokens=hp.max_seq_length, test_command=args.test_command,
+        checkpoint_dir=out / "task_checkpoints",
+    ))
+    if set(results) != {"A", "B", "C", "D"} or any(not rows for rows in results.values()):
+        raise SystemExit("one or more conditions produced no real task results")
+    raw = {condition: [asdict(row) for row in rows] for condition, rows in results.items()}
+    (out / "task_results_abcd.json").write_text(json.dumps(raw, indent=2))
+    summary = aggregate_metrics(results)
+    (out / "metrics.json").write_text(json.dumps(summary, indent=2))
 
-    print("=== 10. Contamination audit ===")
-    train_fams = {t.family_id for t in train_tasks}
-    eval_fams = {t.family_id for t in eval_tasks}
-    contam = contamination_audit(train_tasks, eval_tasks, train_fams, eval_fams)
-    with open(out / "contamination_report.json", "w") as fh:
-        json.dump(contam, fh, indent=2)
-    print(f"  contamination = {contam['status']}")
-
-    print("=== 11. Dashboard ===")
+    contamination = json.loads((data_dir / "contamination_report.json").read_text())
+    gate = {
+        "status": "PASS",
+        "real_inference": True,
+        "adapter_config_present": adapter_config.is_file(),
+        "adapter_weights_present": adapter_weights.is_file(),
+        "conditions_complete": True,
+        "contamination_status": contamination["status"],
+    }
+    (out / "verification_gate.json").write_text(json.dumps(gate, indent=2))
     examples = []
-    for t in eval_tasks[:4]:
-        examples.append({
-            "task_id": t.task_id,
-            "A": "lower confidence / missing edges (sim)",
-            "D": "higher recall via impact neighborhood (sim)",
-        })
-    dash = build_dashboard(
-        summary,
-        contam,
-        gate.__dict__,
-        examples,
-        out / "dashboard.html",
-    )
+    by_a = {r.task_id: r for r in results["A"]}
+    by_d = {r.task_id: r for r in results["D"]}
+    for task_id in list(by_a)[:4]:
+        examples.append({"task_id": task_id, "A": by_a[task_id].raw_output, "D": by_d[task_id].raw_output})
+    dashboard = build_dashboard(summary, contamination, gate, examples, out / "dashboard.html")
     write_streamlit_app(out / "streamlit_app.py")
-    print(f"  wrote {dash}")
-
+    report = out / "report.md"
+    report.write_text(
+        "# RSEF measured experiment report\n\n"
+        f"- Target HEAD: `{_git_head(repo)}`\n"
+        f"- Model: `{hp.model_name_or_path}`\n"
+        f"- GPU: `{hardware['gpu_model']}` ({hardware['vram_gib']} GiB)\n"
+        f"- CUDA: `{hardware['cuda_version']}`\n"
+        f"- Contamination audit: **{contamination['status']}**\n"
+        f"- Verification gate: **{gate['status']}**\n\n"
+        "## Pretraining counts\n\n```json\n" + json.dumps(counts, indent=2) +
+        "\n```\n\n## A/B/C/D metrics\n\n```json\n" + json.dumps(summary, indent=2) + "\n```\n",
+        encoding="utf-8",
+    )
     index = {
         "target_repo": "holeyfield33-art/runtime-firewall-mvp",
-        "question": (
-            "Does repository-specific adaptation plus structured file knowledge "
-            "and graph context outperform the same untuned small model using "
-            "ordinary repository-wide context?"
-        ),
+        "target_head": _git_head(repo),
+        "model": hp.model_name_or_path,
+        "hardware": hardware,
+        "pretraining": counts,
         "artifacts": {
-            "repository_manifest": str(data_dir / "repository_manifest.json"),
-            "dependency_graph": str(data_dir / "dependency_graph.json"),
-            "file_packs": str(packs_dir),
-            "splits": {k: str(v) for k, v in split_paths.items()},
-            "qlora_config": str(out / "qlora_config.yaml"),
-            "adapter": str(adapter_marker),
-            "summary": str(out / "summary.json"),
-            "contamination_report": str(out / "contamination_report.json"),
-            "verification_gate": str(out / "verification_gate.json"),
-            "dashboard": str(dash),
+            "metrics": str(out / "metrics.json"),
+            "contamination_report": str(data_dir / "contamination_report.json"),
+            "adapter_config": str(adapter_config),
+            "adapter_weights": str(adapter_weights),
+            "task_results": str(out / "task_results_abcd.json"),
+            "dashboard": str(dashboard),
+            "report": str(report),
         },
-        "conditions": CONDITIONS,
-        "summary": summary,
-        "contamination_status": contam["status"],
-        "gate_status": gate.status,
+        "verification_gate": gate,
     }
-    with open(out / "experiment_index.json", "w") as fh:
-        json.dump(index, fh, indent=2)
-
-    print("\n=== DONE ===")
-    print(f"All artifacts under: {out}")
-    print("Open results/dashboard.html in a browser for the comparison view.")
+    (out / "experiment_index.json").write_text(json.dumps(index, indent=2))
+    print(json.dumps(summary, indent=2), flush=True)
 
 
 if __name__ == "__main__":

@@ -203,7 +203,10 @@ def ingest_repository(
         try:
             repo = git.Repo(root)
             head_sha = repo.head.commit.hexsha
-            for c in repo.iter_commits(max_count=200):
+            # RSEF experiments are history based.  Silently truncating history
+            # changes the family split and can move held-out work into training.
+            # Always ingest the complete reachable history.
+            for c in repo.iter_commits():
                 files_changed = list(c.stats.files.keys()) if c.stats else []
                 commits.append(
                     CommitRecord(
