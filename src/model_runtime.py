@@ -30,6 +30,14 @@ class InferenceError(RuntimeError):
     pass
 
 
+def validate_compute_dtype(name: str, bf16_supported: bool) -> str:
+    if name not in ("float16", "bfloat16"):
+        raise InferenceError(f"unsupported compute dtype: {name}")
+    if name == "bfloat16" and not bf16_supported:
+        raise InferenceError("BF16 is unsupported; use --compute-dtype float16 for a T4 run")
+    return name
+
+
 @dataclass
 class Generation:
     parsed: Dict[str, Any]
@@ -81,10 +89,13 @@ class HFGenerator:
         adapter_path: Optional[Path] = None,
         max_input_tokens: int = 2048,
         max_new_tokens: int = 512,
+        compute_dtype: str = "bfloat16",
     ):
         require_cuda()
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+        validate_compute_dtype(compute_dtype, torch.cuda.is_bf16_supported())
 
         self.torch = torch
         self.max_input_tokens = max_input_tokens
@@ -95,7 +106,7 @@ class HFGenerator:
         quant = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=getattr(torch, compute_dtype),
             bnb_4bit_use_double_quant=True,
         )
         model = AutoModelForCausalLM.from_pretrained(
@@ -111,6 +122,13 @@ class HFGenerator:
                 raise InferenceError(f"missing trained adapter config: {config}")
             model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=False)
         self.model = model.eval()
+
+    def close(self) -> None:
+        """Release inference VRAM before the separate training process starts."""
+        import gc
+        self.model = None
+        gc.collect()
+        self.torch.cuda.empty_cache()
 
     def generate(self, instruction: str, context: str) -> Generation:
         messages = [

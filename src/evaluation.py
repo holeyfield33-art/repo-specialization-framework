@@ -239,6 +239,7 @@ def run_condition_group(
     max_input_tokens: int = 2048,
     test_command: str = "npm test",
     checkpoint_dir: Optional[Path] = None,
+    compute_dtype: str = "bfloat16",
 ) -> Dict[str, List[MetricResult]]:
     if any(c in ("C", "D") for c in conditions) and adapter_path is None:
         raise InferenceError("tuned conditions require a real adapter")
@@ -247,14 +248,18 @@ def run_condition_group(
         model_name,
         adapter_path=adapter_path,
         max_input_tokens=max_input_tokens,
+        compute_dtype=compute_dtype,
     )
-    return {
-        condition: evaluate_condition(
-            eval_tasks, condition, generator, snapshot, repo_path, test_command,
-            (checkpoint_dir / f"condition_{condition}.jsonl") if checkpoint_dir else None,
-        )
-        for condition in conditions
-    }
+    try:
+        return {
+            condition: evaluate_condition(
+                eval_tasks, condition, generator, snapshot, repo_path, test_command,
+                (checkpoint_dir / f"condition_{condition}.jsonl") if checkpoint_dir else None,
+            )
+            for condition in conditions
+        }
+    finally:
+        generator.close()
 
 
 def contamination_audit(

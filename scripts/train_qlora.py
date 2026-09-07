@@ -101,7 +101,13 @@ def main() -> None:
         target_modules=cfg["target_modules"], bias=cfg["bias"], task_type=cfg["task_type"],
     ))
 
-    bf16 = bool(torch.cuda.is_bf16_supported())
+    # Honor the saved run configuration, even on hardware supporting both types.
+    dtype_name = cfg["bnb_4bit_compute_dtype"]
+    if dtype_name not in ("float16", "bfloat16"):
+        raise SystemExit(f"unsupported compute dtype: {dtype_name}")
+    bf16 = dtype_name == "bfloat16"
+    if bf16 and not torch.cuda.is_bf16_supported():
+        raise SystemExit("configured BF16 is unsupported by this GPU")
     training_kwargs = dict(
         output_dir=cfg["output_dir"],
         per_device_train_batch_size=cfg["per_device_train_batch_size"],

@@ -51,6 +51,19 @@ Any 0.5B–3B instruction-tuned causal LM can be added via `QLoRAHyperParams.for
 
 ## Colab: first real run
 
+### T4 GPU runs
+
+Use `--compute-dtype float16` on the measured `scripts.run_experiment` command
+for a T4. This explicitly selects FP16 for all A/B/C/D inference and QLoRA
+training and records it in `hardware.json` and `qlora_config.yaml`. The default
+remains BF16. Use a fresh output directory such as `results/qwen-t4-fp16`; do
+not mix these results with older BF16 or edited CPU runs. CPU-only execution
+supports preparation and integrity tests, not the measured training pipeline.
+
+Install the complete `requirements.txt`, including GitPython, before preparing
+data. Never repair an empty split by sharing a change family across train/eval
+or forcing the contamination audit to pass.
+
 ```bash
 # Colab terminal/cell commands. Use full clones; do not add --depth.
 cd /content
@@ -83,7 +96,9 @@ python -m scripts.run_experiment \
 
 The runner prints and exports GPU model, VRAM, CUDA and PyTorch versions before inference/training. The pretraining report prints source files, graph edges, independent families, train/validation/evaluation family and task counts, and contamination status.
 
-The committed QLoRA configuration uses `bfloat16`, as specified by the original harness. The runner stops rather than silently switching precision when the assigned GPU lacks BF16 support. Changing that setting requires explicit approval because it changes a training hyperparameter.
+The default QLoRA configuration uses `bfloat16`. The runner stops rather than
+silently switching precision when BF16 is unsupported. A T4 run must explicitly
+select `--compute-dtype float16`; this is a different recorded precision setting.
 
 ### Second small model, unchanged data
 

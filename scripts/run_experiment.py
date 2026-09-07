@@ -26,7 +26,7 @@ from src.history_tasks import (
 )
 from src.ingestion import ingest_repository, save_manifest
 from src.ingestion import compute_sha256
-from src.model_runtime import require_cuda
+from src.model_runtime import require_cuda, validate_compute_dtype
 from src.qlora_config import QLoRAHyperParams
 
 
@@ -126,6 +126,8 @@ def main() -> None:
     parser.add_argument("--prepared-data", type=Path)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--test-command", default="npm test")
+    parser.add_argument("--compute-dtype", choices=["bfloat16", "float16"], default="bfloat16",
+                        help="Explicit precision for inference and training; use float16 on T4")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
@@ -147,11 +149,15 @@ def main() -> None:
         return
 
     hardware = require_cuda()
+    import torch
+    validate_compute_dtype(args.compute_dtype, torch.cuda.is_bf16_supported())
+    hardware["compute_dtype"] = args.compute_dtype
     (out / "hardware.json").write_text(json.dumps(hardware, indent=2))
     print("=== GPU/CUDA ===", flush=True)
     print(json.dumps(hardware, indent=2), flush=True)
 
     hp = QLoRAHyperParams.for_model(args.model)
+    hp.bnb_4bit_compute_dtype = args.compute_dtype
     hp.output_dir = str(out / "adapters" / f"{args.model}-repo-qlora")
     hp.save(out / "qlora_config.yaml")
     adapter = Path(hp.output_dir)
@@ -171,6 +177,7 @@ def main() -> None:
         eval_tasks, ["A", "B"], repo, hp.model_name_or_path,
         max_input_tokens=hp.max_seq_length, test_command=args.test_command,
         checkpoint_dir=out / "task_checkpoints",
+        compute_dtype=args.compute_dtype,
     )
     (out / "task_results_ab.json").write_text(json.dumps(
         {condition: [asdict(row) for row in rows] for condition, rows in results.items()}, indent=2,
@@ -193,6 +200,7 @@ def main() -> None:
         eval_tasks, ["C", "D"], repo, hp.model_name_or_path, adapter,
         max_input_tokens=hp.max_seq_length, test_command=args.test_command,
         checkpoint_dir=out / "task_checkpoints",
+        compute_dtype=args.compute_dtype,
     ))
     if set(results) != {"A", "B", "C", "D"} or any(not rows for rows in results.values()):
         raise SystemExit("one or more conditions produced no real task results")
