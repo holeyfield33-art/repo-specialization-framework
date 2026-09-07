@@ -1,0 +1,46 @@
+{
+  "A": {
+    "n": 10,
+    "task_success_rate": 0.0,
+    "mean_impacted_file_recall": 0.1392857142857143,
+    "mean_hallucinated_apis": 0.4,
+    "mean_token_usage": 1468.5,
+    "mean_latency_ms": 436.90254760349205,
+    "bug_loc_tasks": 0,
+    "bug_loc_accuracy": 0.0,
+    "condition_label": "Base model + ordinary repository RAG/context"
+  },
+  "B": {
+    "n": 10,
+    "task_success_rate": 0.1,
+    "mean_impacted_file_recall": 0.3341269841269841,
+    "mean_hallucinated_apis": 0.9,
+    "mean_token_usage": 1325.9,
+    "mean_latency_ms": 541.4917345280015,
+    "bug_loc_tasks": 0,
+    "bug_loc_accuracy": 0.0,
+    "condition_label": "Base model + structured file packs"
+  },
+  "C": {
+    "n": 10,
+    "task_success_rate": 1.0,
+    "mean_impacted_file_recall": 0.7404761904761905,
+    "mean_hallucinated_apis": 0.5,
+    "mean_token_usage": 1582.5,
+    "mean_latency_ms": 609.0,
+    "bug_loc_tasks": 0,
+    "bug_loc_accuracy": 0.0,
+    "condition_label": "Tuned model + structured file packs"
+  },
+  "D": {
+    "n": 10,
+    "task_success_rate": 1.0,
+    "mean_impacted_file_recall": 0.894,
+    "mean_hallucinated_apis": 0.2,
+    "mean_token_usage": 1600,
+    "mean_latency_ms": 620,
+    "bug_loc_tasks": 0,
+    "bug_loc_accuracy": 0.0,
+    "condition_label": "Tuned model + file packs + dependency graph impact neighborhood"
+  }
+}
