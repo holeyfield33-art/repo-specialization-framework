@@ -23,6 +23,7 @@ Two modes, and the difference matters:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -43,9 +44,19 @@ from src.evaluation import (
     aggregate_metrics,
     deterministic_verify,
     run_provenance,
+    scoreability_report,
+    verify_adapter_provenance,
     CONDITIONS,
 )
 from src.dashboard import build_dashboard, write_streamlit_app
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def main() -> None:
@@ -71,6 +82,13 @@ def main() -> None:
         type=int,
         default=200,
         help="Optimizer steps for --real-train.",
+    )
+    parser.add_argument(
+        "--allow-unverified-adapter",
+        action="store_true",
+        default=False,
+        help="Accept adapter weights that cannot be shown to belong to this run. "
+             "The 'real' label on conditions C/D is then unproven.",
     )
     parser.add_argument(
         "--eval-mode",
@@ -132,6 +150,7 @@ def main() -> None:
                 "--out", str(adapter_marker),
                 "--steps", str(args.train_steps),
                 "--packs_dir", str(packs_dir),
+                "--repo_head", str(manifest.head_sha or ""),
                 "--lora_r", str(hp.lora_r),
                 "--lora_alpha", str(hp.lora_alpha),
                 "--lr", str(hp.learning_rate),
@@ -157,7 +176,31 @@ def main() -> None:
             "conditions C/D would be UNTESTED, not untuned."
         )
 
+    adapter_check = None
+    if args.eval_mode == "real":
+        # Weights with the right filename are not proof of anything. An adapter
+        # from another repo, revision or base model would load fine and its
+        # C/D numbers would still be labelled "real".
+        try:
+            adapter_check = verify_adapter_provenance(
+                adapter_marker,
+                {
+                    "base_model": hp.model_name_or_path,
+                    "repo_head_sha": str(manifest.head_sha or ""),
+                    "train_split_sha256": _sha256_file(split_paths["train"]),
+                },
+                allow_unverified=args.allow_unverified_adapter,
+            )
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        print(f"  adapter provenance: {adapter_check['status']}")
+
     print(f"=== 7-8. Evaluation (4 conditions, mode={args.eval_mode}) ===")
+    scoreability = scoreability_report(eval_tasks)
+    if scoreability["excluded"]:
+        print(f"  excluding {scoreability['excluded']}/{scoreability['eval_tasks_total']} "
+              f"eval tasks with no comparable answer: "
+              f"{scoreability['excluded_by_task_type']}")
     results_by_cond = run_all_conditions(
         eval_tasks,
         packs_dir,
@@ -166,7 +209,7 @@ def main() -> None:
         mode=args.eval_mode,
         base_model_name=hp.model_name_or_path,
     )
-    summary = aggregate_metrics(results_by_cond)
+    summary = aggregate_metrics(results_by_cond, scoreability)
     provenance = run_provenance(summary)
     with open(out / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
@@ -253,6 +296,8 @@ def main() -> None:
         },
         "conditions": CONDITIONS,
         "data_provenance": provenance,
+        "scoreability": scoreability,
+        "adapter_provenance_check": adapter_check,
         "eval_mode": args.eval_mode,
         "real_train": args.real_train,
         "adapter_trained": adapter_weights.exists(),

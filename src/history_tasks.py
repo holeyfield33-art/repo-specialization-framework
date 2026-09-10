@@ -141,7 +141,8 @@ def generate_tasks_from_history(
         if not changed:
             continue
         neigh = graph.impact_neighborhood(changed, radius=1, max_nodes=15)
-        related = list(set(neigh["nodes"]) - set(changed))
+        # sorted, not list(set(...)): this ordering becomes ground truth
+        related = sorted(set(neigh["nodes"]) - set(changed))
 
         tasks.append(
             TaskExample(
@@ -287,7 +288,7 @@ def generate_tasks_from_history(
         js_files = [f.path for f in manifest.files if f.language == "javascript"]
         for i, path in enumerate(js_files[:6]):
             neigh = graph.impact_neighborhood([path], radius=1, max_nodes=10)
-            related = [n for n in neigh["nodes"] if n != path]
+            related = sorted(n for n in neigh["nodes"] if n != path)
             tasks.append(
                 TaskExample(
                     task_id=f"heldout-impact-{i}-{Path(path).stem}",

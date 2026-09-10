@@ -10,7 +10,14 @@ output (scores just look good), so it gets a test rather than a comment.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.evaluation import _answer_leaks_into_context
 from src.history_tasks import CANDIDATE_SET_TASK_TYPES, enforce_context_answer_disjoint
@@ -145,3 +152,58 @@ def test_bug_localization_still_exists_after_enforcement(pipeline):
     types = {t.task_type for t in pipeline["tasks"]}
     assert "change_impact_prediction" in types
     assert "test_impact_prediction" in types
+
+
+# --- determinism -------------------------------------------------------------
+
+def test_task_generation_is_deterministic_across_processes(sample_repo):
+    """The framework's premise is deterministic, SHA-bound artifacts.
+
+    `list(some_set_of_strings)` iterates in an order that varies per process
+    with PYTHONHASHSEED, so identical inputs produced different ground truth,
+    different file packs and different SHAs on every run. This runs generation
+    in separate subprocesses precisely because a same-process loop would share
+    one hash seed and pass regardless.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        f"""
+        import sys, json, hashlib
+        sys.path.insert(0, {str(ROOT)!r})
+        from pathlib import Path
+        from dataclasses import asdict
+        from src.ingestion import ingest_repository
+        from src.graph import build_dependency_graph
+        from src.history_tasks import generate_tasks_from_history
+
+        m = ingest_repository(Path({str(sample_repo)!r}), repo_name="r", include_content=True)
+        g = build_dependency_graph(m)
+        tasks = generate_tasks_from_history(m, g)
+        blob = "".join(json.dumps(asdict(t), sort_keys=True) for t in tasks)
+        print(hashlib.sha256(blob.encode()).hexdigest())
+        """
+    )
+    digests = set()
+    for seed in ("0", "1", "12345"):
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode == 0, proc.stderr
+        digests.add(proc.stdout.strip())
+    assert len(digests) == 1, (
+        f"task generation is not reproducible across hash seeds: {digests}"
+    )
+
+
+def test_impact_neighborhood_returns_sorted_collections(pipeline):
+    graph = pipeline["graph"]
+    seeds = [f.path for f in pipeline["manifest"].files][:2]
+    neigh = graph.impact_neighborhood(seeds, radius=1, max_nodes=25)
+    assert neigh["nodes"] == sorted(neigh["nodes"])
+    assert neigh["seeds"] == sorted(neigh["seeds"])
+    edge_keys = [(e["src"], e["dst"], e["type"]) for e in neigh["edges"]]
+    assert edge_keys == sorted(edge_keys)

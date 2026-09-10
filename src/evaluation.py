@@ -18,6 +18,7 @@ from .prompting import (
     SYSTEM_PROMPT,
     build_prompt,
     expected_answer_paths,
+    is_scoreable,
     known_repo_paths,
     parse_answer,
 )
@@ -200,6 +201,52 @@ def require_adapter(adapter_path: Optional[Path], condition: str) -> Path:
     return path
 
 
+#: Written by scripts/train_real.py next to the adapter weights.
+ADAPTER_PROVENANCE_FILE = "adapter_provenance.json"
+
+
+def verify_adapter_provenance(
+    adapter_path: Path,
+    expected: Dict[str, Any],
+    allow_unverified: bool = False,
+) -> Dict[str, Any]:
+    """Check that adapter weights belong to THIS run before trusting them.
+
+    require_adapter only proves a file with the right name exists. An adapter
+    left over from another repository, another revision, or another base model
+    loads fine and its C/D metrics would still be labelled "real". Provenance
+    is what makes the "real" label mean something.
+    """
+    record_path = Path(adapter_path) / ADAPTER_PROVENANCE_FILE
+    if not record_path.exists():
+        if allow_unverified:
+            return {"status": "UNVERIFIED", "reason": "no provenance record"}
+        raise RuntimeError(
+            f"adapter at {adapter_path} has no {ADAPTER_PROVENANCE_FILE}, so it "
+            "cannot be shown to belong to this run. It may have been trained on "
+            "another repository, revision, or base model. Re-train with "
+            "--real-train, or pass --allow-unverified-adapter to accept it "
+            "knowing the 'real' label is then unproven."
+        )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    mismatches = {
+        key: {"adapter": record.get(key), "this_run": value}
+        for key, value in expected.items()
+        if record.get(key) != value
+    }
+    if mismatches and not allow_unverified:
+        raise RuntimeError(
+            f"adapter at {adapter_path} was not trained for this run: "
+            f"{json.dumps(mismatches, indent=2)}. Re-train with --real-train, or "
+            "pass --allow-unverified-adapter to accept it anyway."
+        )
+    return {
+        "status": "VERIFIED" if not mismatches else "MISMATCH_ACCEPTED",
+        "record": record,
+        "mismatches": mismatches,
+    }
+
+
 def _load_model(base_model_name: str, adapter_path: Optional[Path]) -> Tuple[Any, Any]:
     key = (base_model_name, str(adapter_path) if adapter_path else "")
     if key in _MODEL_CACHE:
@@ -272,6 +319,12 @@ def real_model_response(
     else:
         text = f"{SYSTEM_PROMPT}\n\n{prompt}\n\nAnswer: "
 
+    # Training truncates the prompt from the left so the answer survives
+    # (train_real.encode). Evaluation must do the same: right truncation drops
+    # the tail of the prompt, which holds the answer-schema hint and, for
+    # condition D, the entire graph neighborhood — D would lose its defining
+    # input on any long prompt.
+    tokenizer.truncation_side = "left"
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     prompt_tokens = int(inputs["input_ids"].shape[-1])
@@ -308,7 +361,14 @@ def real_model_response(
         sum(1 for path in predicted if path not in repo_paths) if repo_paths else 0
     )
     expected = expected_answer_paths(task)
-    hit = bool(set(expected) & set(predicted)) if expected else bool(predicted)
+    if not expected:
+        # evaluate_condition filters these out; reaching here means the filter
+        # regressed, and guessing a score would silently inflate the run.
+        raise RuntimeError(
+            f"task {task.task_id} ({task.task_type}) has no comparable ground-truth "
+            "path list and must not be scored"
+        )
+    hit = bool(set(expected) & set(predicted))
 
     return {
         "success": hit,
@@ -365,6 +425,9 @@ def evaluate_condition(
     results = []
     for t in tasks:
         if t.split != "eval":
+            continue
+        if not is_scoreable(t):
+            # No comparable answer -> excluded, not scored. See is_scoreable.
             continue
         t0 = time.time()
         if mode == "real":
@@ -526,7 +589,37 @@ def run_provenance(summary: Dict[str, Any]) -> str:
     return "mixed"
 
 
-def aggregate_metrics(results_by_cond: Dict[str, List[MetricResult]]) -> Dict[str, Any]:
+def scoreability_report(eval_tasks: List[TaskExample]) -> Dict[str, Any]:
+    """Which eval tasks can be scored, and which were excluded and why.
+
+    Excluded tasks are not failures and not successes — they are outside what
+    impacted-file overlap can measure. Reporting the count keeps a shrinking
+    eval set visible instead of quietly changing what the headline rate means.
+    """
+    scoreable, excluded = [], []
+    for t in eval_tasks:
+        if t.split != "eval":
+            continue
+        (scoreable if is_scoreable(t) else excluded).append(t)
+    by_type: Dict[str, int] = {}
+    for t in excluded:
+        by_type[t.task_type] = by_type.get(t.task_type, 0) + 1
+    return {
+        "eval_tasks_total": len(scoreable) + len(excluded),
+        "scoreable": len(scoreable),
+        "excluded": len(excluded),
+        "excluded_by_task_type": by_type,
+        "reason": (
+            "ground truth has no comparable file-path list; scoring these by "
+            "impacted-file overlap would count any non-empty answer as correct"
+        ),
+    }
+
+
+def aggregate_metrics(
+    results_by_cond: Dict[str, List[MetricResult]],
+    scoreability: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     summary = {}
     for cond, rows in results_by_cond.items():
         if not rows:
@@ -548,4 +641,6 @@ def aggregate_metrics(results_by_cond: Dict[str, List[MetricResult]]) -> Dict[st
             ),
             "condition_label": CONDITIONS[cond],
         }
+        if scoreability is not None:
+            summary[cond]["unscoreable_excluded"] = scoreability["excluded"]
     return summary

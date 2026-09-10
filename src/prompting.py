@@ -49,6 +49,19 @@ def expected_answer_paths(task: Any) -> List[str]:
     return []
 
 
+def is_scoreable(task: Any) -> bool:
+    """True when the task's ground truth yields a path list the evaluator can
+    actually compare a prediction against.
+
+    Tasks without one (code_review stores `files`/`suggested_checks`,
+    cross_file_dependency_reasoning stores `edges`) cannot be scored by
+    impacted-file overlap. They must be EXCLUDED rather than scored, because
+    "no expected answer" previously meant any non-empty prediction counted as a
+    success — a hallucinated path list scored 100%.
+    """
+    return bool(expected_answer_paths(task))
+
+
 def pack_path_for(packs_dir: Path, repo_path: str) -> Path:
     """Mirror of the naming used by file_packs.generate_file_packs."""
     safe_name = repo_path.replace("/", "__").replace("\\", "__")

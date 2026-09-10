@@ -111,30 +111,39 @@ class DependencyGraph:
             except Exception:
                 pass
         if len(nodes) > max_nodes:
+            # Ties must break on a stable key. Sorting by degree alone leaves
+            # equal-degree nodes in set-iteration order, which varies per
+            # process with PYTHONHASHSEED.
             others = sorted(
                 (n for n in nodes if n not in seeds),
-                key=lambda n: self.g.degree(n) if n in self.g else 0,
-                reverse=True,
+                key=lambda n: (-(self.g.degree(n) if n in self.g else 0), n),
             )
             nodes = set(seeds) | set(others[: max_nodes - len(seeds)])
         sub = self.g.subgraph(nodes)
-        edge_list = [
-            {
-                "src": u,
-                "dst": v,
-                "type": d.get("edge_type", "IMPORTS"),
-                "confidence": d.get("confidence", 0.5),
-            }
-            for u, v, d in sub.edges(data=True)
-        ]
+        edge_list = sorted(
+            (
+                {
+                    "src": u,
+                    "dst": v,
+                    "type": d.get("edge_type", "IMPORTS"),
+                    "confidence": d.get("confidence", 0.5),
+                }
+                for u, v, d in sub.edges(data=True)
+            ),
+            key=lambda e: (e["src"], e["dst"], e["type"]),
+        )
         unresolved = []
-        for n in nodes:
+        for n in sorted(nodes):
             for e in self.edges:
                 if e.src == n and e.dst not in self.g:
                     unresolved.append({"node": n, "missing": e.dst, "type": e.edge_type})
+        # Every derived collection is sorted: this neighbourhood feeds task
+        # ground truth, file packs and their SHAs. Set iteration order is not
+        # stable across processes, so returning list(set) made the framework's
+        # "deterministic, SHA-bound artifacts" claim false between runs.
         return {
-            "seeds": list(seeds),
-            "nodes": list(nodes),
+            "seeds": sorted(seeds),
+            "nodes": sorted(nodes),
             "edges": edge_list,
             "uncertainty": unresolved[:50],
             "radius": radius,

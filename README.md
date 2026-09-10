@@ -18,6 +18,22 @@ Target repository for this experiment: **[holeyfield33-art/runtime-firewall-mvp]
 
 `--eval-mode real` without trained adapter weights **fails the run**. It never falls
 back to simulation: conditions C/D without an adapter are UNTESTED, not merely untuned.
+Reused adapter weights must also carry an `adapter_provenance.json` matching this run's
+base model, repository HEAD and training split, or the run fails — weights with the right
+filename are not proof they were trained for this experiment.
+
+### Known limitation: temporal integrity of file packs
+
+File packs are generated from one repository snapshot (HEAD). Training tasks come from
+earlier commits, so their prompts carry state that did not exist at the task's commit —
+including state from the commits held out for evaluation. The change-family split does
+not prevent this and the contamination audit cannot see it, because it compares task
+metadata rather than pack contents.
+
+`train_real.py` detects and records this as `temporal_integrity` in
+`training_trace.json` and `adapter_provenance.json`, and warns on stdout. Until packs are
+generated per-commit, treat conditions C/D from such an adapter as temporally
+contaminated. Generating packs at each task's commit is the real fix and is follow-up work.
 
 ## Supported models
 

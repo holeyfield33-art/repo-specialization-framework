@@ -137,16 +137,39 @@ document.getElementById("gate").textContent = JSON.stringify(DATA.sample_gate, n
 
 const ex = document.getElementById("examples");
 (DATA.examples || []).forEach(pair => {
+  // pair.A / pair.D can contain raw model output. Build with textContent so
+  // markup in a completion renders as characters, never as DOM.
   const div = document.createElement("div");
-  div.innerHTML = `<h3 class="mono">${pair.task_id}</h3>
-    <p><b>A (base RAG)</b>: ${pair.A}</p>
-    <p><b>D (tuned+packs+graph)</b>: ${pair.D}</p>`;
+  const h = document.createElement("h3");
+  h.className = "mono";
+  h.textContent = pair.task_id;
+  div.appendChild(h);
+  [["A (base RAG)", pair.A], ["D (tuned+packs+graph)", pair.D]].forEach(([label, value]) => {
+    const p = document.createElement("p");
+    const b = document.createElement("b");
+    b.textContent = label;
+    p.appendChild(b);
+    p.appendChild(document.createTextNode(": " + (value == null ? "" : String(value))));
+    div.appendChild(p);
+  });
   ex.appendChild(div);
 });
 </script>
 </body>
 </html>
 """
+
+
+def _script_safe_json(payload: Dict[str, Any]) -> str:
+    """JSON encoded so it cannot terminate the enclosing <script> element."""
+    return (
+        json.dumps(payload)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def build_dashboard(
@@ -165,7 +188,11 @@ def build_dashboard(
         # from must not render as though they were measured.
         "provenance": run_provenance(summary),
     }
-    html = DASHBOARD_HTML.replace("__DATA_JSON__", json.dumps(payload))
+    # In real mode, MetricResult.notes can carry raw model output. That text
+    # reaches this page, so it is escaped for safe embedding inside an inline
+    # <script>: a completion containing "</script>" would otherwise close the
+    # tag and execute whatever followed when the dashboard is opened.
+    html = DASHBOARD_HTML.replace("__DATA_JSON__", _script_safe_json(payload))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")
     return out_path

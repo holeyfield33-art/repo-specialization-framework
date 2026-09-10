@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -39,8 +40,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
-
-import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -243,6 +242,60 @@ def build_examples(
     return out
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_temporal_integrity(
+    packs_dir: Optional[Path], tasks: List[SimpleNamespace]
+) -> Dict[str, Any]:
+    """Detect future state reaching historical training prompts.
+
+    File packs are generated from one repository snapshot. When that snapshot
+    is HEAD and the training tasks come from earlier commits, each prompt
+    carries source, dependency and test metadata that did not exist at the
+    task's commit — including changes from the very commits held out for
+    evaluation. The temporal family split does not prevent this, and the
+    contamination audit cannot see it, because it compares task metadata and
+    not pack contents.
+
+    Fixing it properly means generating packs at each task's commit, which is
+    follow-up work. Detecting and recording it is not: a run must not be able
+    to claim temporal integrity it does not have.
+    """
+    if packs_dir is None:
+        return {
+            "status": "NO_PACKS",
+            "note": "training prompts carry no pack contents, so no pack-state leakage",
+        }
+    index_path = packs_dir / "index.json"
+    if not index_path.exists():
+        return {"status": "UNKNOWN", "note": f"no pack index at {index_path}"}
+    packs_head = json.loads(index_path.read_text(encoding="utf-8")).get("head_sha")
+    train_commits = sorted({str(getattr(t, "commit_sha", "")) for t in tasks})
+    historical = [c for c in train_commits if c and c != packs_head]
+    if not packs_head:
+        return {"status": "UNKNOWN", "note": "pack index records no head_sha"}
+    if not historical:
+        return {"status": "OK", "packs_head_sha": packs_head}
+    return {
+        "status": "HEAD_STATE_PACKS",
+        "packs_head_sha": packs_head,
+        "training_commits_predating_packs": historical[:20],
+        "note": (
+            "Training prompts contain repository state from the pack snapshot, "
+            "not from each task's own commit. Post-cutoff content — including "
+            "state from evaluation commits — can therefore reach the adapter. "
+            "Treat conditions C/D from this adapter as temporally contaminated "
+            "until packs are generated per-commit."
+        ),
+    }
+
+
 def encode(tokenizer, prompt: str, target: str, max_seq_length: int):
     """Tokenize one example, masking the prompt so loss is computed on the
     completion only.
@@ -251,6 +304,8 @@ def encode(tokenizer, prompt: str, target: str, max_seq_length: int):
     context that is supplied at inference anyway — the adapter is supposed to
     learn conventions, not facts that live in the packs.
     """
+    import torch
+
     if tokenizer.chat_template:
         prompt_text = tokenizer.apply_chat_template(
             [
@@ -286,6 +341,8 @@ def encode(tokenizer, prompt: str, target: str, max_seq_length: int):
 # --------------------------------------------------------------------------
 
 def select_backend(allow_4bit: bool = True) -> Dict[str, Any]:
+    import torch
+
     if not torch.cuda.is_available():
         return {"device": "cpu", "quantized": False, "gpu_name": None}
     try:
@@ -322,9 +379,14 @@ def main() -> None:
                    type=int, default=2048)
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--repo_head", default=None,
+                   help="Repository HEAD sha this training run belongs to; recorded "
+                        "in adapter_provenance.json so evaluation can verify reuse.")
     p.add_argument("--no_4bit", action="store_true",
                    help="Force full-precision LoRA even when bitsandbytes is available.")
     args = p.parse_args()
+
+    import torch
 
     torch.manual_seed(args.seed)
 
@@ -333,6 +395,12 @@ def main() -> None:
 
     tasks = load_train_examples(args.train_jsonl)
     examples = build_examples(tasks, args.packs_dir)
+
+    temporal = check_temporal_integrity(args.packs_dir, tasks)
+    if temporal["status"] == "HEAD_STATE_PACKS":
+        print("=== WARNING: temporal integrity — " + temporal["note"] + " ===")
+    else:
+        print(f"=== temporal integrity: {temporal['status']} ===")
     print(f"=== {len(tasks)} real tasks -> {len(examples)} supervisable examples "
           f"from {args.train_jsonl} ===")
 
@@ -442,6 +510,20 @@ def main() -> None:
         )
     print(f"=== real adapter saved to {args.out} ===")
 
+    provenance = {
+        "base_model": args.model,
+        "repo_head_sha": args.repo_head,
+        "train_split_sha256": sha256_file(args.train_jsonl),
+        "train_jsonl": str(args.train_jsonl),
+        "packs_head_sha": temporal.get("packs_head_sha"),
+        "steps": args.steps,
+        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "temporal_integrity": temporal,
+    }
+    (args.out / "adapter_provenance.json").write_text(
+        json.dumps(provenance, indent=2), encoding="utf-8"
+    )
+
     telemetry_path = args.telemetry or (args.out / "train_telemetry.jsonl")
     telemetry_path.parent.mkdir(parents=True, exist_ok=True)
     with telemetry_path.open("w", encoding="utf-8") as fh:
@@ -467,6 +549,7 @@ def main() -> None:
         "loss_curve": losses,
         "telemetry_path": str(telemetry_path),
         "telemetry_summary": tele_summary,
+        "temporal_integrity": temporal,
     }
     (args.out / "training_trace.json").write_text(
         json.dumps(trace, indent=2), encoding="utf-8"
