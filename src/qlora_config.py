@@ -80,6 +80,11 @@ class QLoRAHyperParams:
         )
 
 
+#: SUPERSEDED by scripts/train_real.py, which is what --real-train actually
+#: executes. This template is retained only as a reference for the HF Trainer
+#: shape; the runner no longer writes it to results/train_qlora.py, because a
+#: script that is emitted but never run was part of how the pipeline came to
+#: look trained without ever training.
 TRAIN_SCRIPT = r'''
 #!/usr/bin/env python3
 """Repo-specific QLoRA SFT. Adapter only; facts remain in packs/graph."""

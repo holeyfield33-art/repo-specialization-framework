@@ -19,3 +19,6 @@ uvicorn
 plotly
 streamlit
 scikit-learn
+
+# dev
+pytest

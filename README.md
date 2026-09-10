@@ -9,6 +9,16 @@ Falsifiable question:
 
 Target repository for this experiment: **[holeyfield33-art/runtime-firewall-mvp](https://github.com/holeyfield33-art/runtime-firewall-mvp)** (Aletheia / Helios runtime firewall for Node.js).
 
+## Two modes — read this before quoting any number
+
+| Mode | Command | What it produces |
+|------|---------|------------------|
+| **simulate** (default) | `python -m scripts.run_experiment --repo <path>` | **No model runs.** Scores come from hardcoded per-condition base rates plus seeded noise, so condition D wins by construction. Every result is labelled `"data_provenance": "simulated"` and the dashboard shows a warning banner. Use it to smoke-test ingestion, packs, graph, splits and dashboard code without a GPU. |
+| **real** | `python -m scripts.run_experiment --repo <path> --real-train --eval-mode real` | Trains a real LoRA adapter and evaluates with real forward passes. Results are labelled `"data_provenance": "real"`. Only these are experimental evidence. |
+
+`--eval-mode real` without trained adapter weights **fails the run**. It never falls
+back to simulation: conditions C/D without an adapter are UNTESTED, not merely untuned.
+
 ## Supported models
 
 | Key | Hugging Face ID | Notes |
@@ -43,10 +53,18 @@ Any 0.5B–3B instruction-tuned causal LM can be added via `QLoRAHyperParams.for
 # from repo root
 pip install -r requirements.txt
 
-# run against the extracted Helios sample (or a full clone)
+# smoke-test the pipeline with no GPU (SIMULATED — not evidence)
 python -m scripts.run_experiment \
   --repo ../helios-sample \
   --model qwen \
+  --out results/
+
+# the real experiment: trains an adapter, runs real inference for all 4 conditions
+python -m scripts.run_experiment \
+  --repo ../helios-sample \
+  --model qwen \
+  --real-train --train-steps 200 \
+  --eval-mode real \
   --out results/
 
 # view dashboard
@@ -63,16 +81,32 @@ git clone --depth 50 https://github.com/holeyfield33-art/runtime-firewall-mvp.gi
 python -m scripts.run_experiment --repo /tmp/runtime-firewall-mvp --out results/full/
 ```
 
-### Real QLoRA (requires GPU + peft/bitsandbytes)
+### Training the adapter directly
+
+`--real-train` shells out to `scripts/train_real.py`, which can also be run on its own:
 
 ```bash
-python results/train_qlora.py \
-  --config results/qlora_config.yaml \
+python scripts/train_real.py \
   --train_jsonl results/data/splits/train.jsonl \
-  --val_jsonl results/data/splits/val.jsonl
+  --packs_dir results/file_packs \
+  --model Qwen/Qwen2.5-Coder-1.5B-Instruct \
+  --out results/adapters/qwen-repo-qlora \
+  --steps 200
 ```
 
-On CPU-only environments the runner writes an adapter placeholder and simulates condition scores so the full evaluation + contamination + dashboard path can still be exercised.
+Runs on CPU (slowly, fp32) or GPU. Add `--load_in_4bit` for QLoRA on CUDA. It writes
+real `adapter_model.safetensors` plus `training_trace.json` (loss curve and per-layer
+gradient norms), and refuses to report success if no weights were written.
+
+Without `--real-train` the runner writes `NOT_TRAINED.txt` into the adapter directory
+instead — a marker, not an adapter. Conditions C/D are then UNTESTED, not untuned.
+
+### Tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -q
+```
 
 ## Layout
 
@@ -84,10 +118,13 @@ repo-specialization-framework/
 │   ├── graph.py          # §3
 │   ├── history_tasks.py  # §4–5
 │   ├── qlora_config.py   # §6
-│   ├── evaluation.py     # §7–10
+│   ├── prompting.py      # shared prompt assembly (training + real eval)
+│   ├── evaluation.py     # §7–10, real + simulated paths
 │   └── dashboard.py      # §11
 ├── scripts/
-│   └── run_experiment.py # end-to-end
+│   ├── run_experiment.py # end-to-end
+│   └── train_real.py     # real LoRA training (writes real adapter weights)
+├── tests/
 ├── configs/
 ├── data/                 # intermediate (created at runtime)
 ├── results/              # all output artifacts

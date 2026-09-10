@@ -8,5 +8,10 @@
     "D": "Tuned model + file packs + dependency graph impact neighborhood"
   },
   "contamination_status": "PASS",
-  "gate_status": "PASS"
+  "gate_status": "PASS",
+  "data_provenance": "simulated",
+  "eval_mode": "simulate",
+  "real_train": false,
+  "adapter_trained": false,
+  "provenance_note": "These numbers were produced by _simulate_model_response. No model ran. They are a pipeline smoke test, not experimental evidence. Re-run with --real-train --eval-mode real to measure the framework's actual question."
 }
