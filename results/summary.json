@@ -8,7 +8,8 @@
     "mean_latency_ms": 436.90254760349205,
     "bug_loc_tasks": 0,
     "bug_loc_accuracy": 0.0,
-    "condition_label": "Base model + ordinary repository RAG/context"
+    "condition_label": "Base model + ordinary repository RAG/context",
+    "data_provenance": "simulated"
   },
   "B": {
     "n": 10,
@@ -19,7 +20,8 @@
     "mean_latency_ms": 541.4917345280015,
     "bug_loc_tasks": 0,
     "bug_loc_accuracy": 0.0,
-    "condition_label": "Base model + structured file packs"
+    "condition_label": "Base model + structured file packs",
+    "data_provenance": "simulated"
   },
   "C": {
     "n": 10,
@@ -30,7 +32,8 @@
     "mean_latency_ms": 609.0,
     "bug_loc_tasks": 0,
     "bug_loc_accuracy": 0.0,
-    "condition_label": "Tuned model + structured file packs"
+    "condition_label": "Tuned model + structured file packs",
+    "data_provenance": "simulated"
   },
   "D": {
     "n": 10,
@@ -41,6 +44,7 @@
     "mean_latency_ms": 620,
     "bug_loc_tasks": 0,
     "bug_loc_accuracy": 0.0,
-    "condition_label": "Tuned model + file packs + dependency graph impact neighborhood"
+    "condition_label": "Tuned model + file packs + dependency graph impact neighborhood",
+    "data_provenance": "simulated"
   }
 }

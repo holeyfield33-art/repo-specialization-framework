@@ -9,11 +9,28 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from .ingestion import RepoManifest, compute_sha256
 from .graph import DependencyGraph
 from .history_tasks import TaskExample
+from .prompting import (
+    SYSTEM_PROMPT,
+    build_prompt,
+    expected_answer_paths,
+    is_scoreable,
+    known_repo_paths,
+    parse_answer,
+)
+
+EvalMode = Literal["real", "simulate"]
+
+DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
+#: Conditions whose whole point is the tuned adapter. In real mode these MUST
+#: load real adapter weights or fail — a silent fall back to the base model
+#: would make C/D indistinguishable from A/B while still being labelled "real".
+TUNED_CONDITIONS = ("C", "D")
 
 
 CONDITIONS = {
@@ -30,6 +47,10 @@ class MetricResult:
     condition: str
     task_type: str
     success: bool
+    #: "real" = produced by an actual model forward pass.
+    #: "simulated" = produced by _simulate_model_response and is NOT evidence.
+    #: Required with no default so no result can be constructed unlabelled.
+    data_provenance: str
     test_pass_rate: float = 0.0
     bug_localization_accuracy: float = 0.0
     impacted_file_recall: float = 0.0
@@ -104,9 +125,14 @@ def _simulate_model_response(
     graph_available: bool,
 ) -> Dict[str, Any]:
     """
-    CPU-only simulation of model behaviour.
-    Tuned + packs + graph (D) scores highest; base RAG (A) lowest.
-    Real inference would call the model / adapter here.
+    CPU-only simulation of model behaviour. NOT EVIDENCE.
+
+    This runs no model. Scores come from hardcoded per-condition base rates
+    plus seeded noise, so condition D "wins" by construction. It exists only to
+    smoke-test ingestion, packs, graph, splits and dashboard code without GPU
+    access. Every number it produces is labelled data_provenance="simulated"
+    and must never be read as an experimental result. For a real measurement
+    use mode="real" (see real_model_response).
     """
     base = {
         "A": 0.35,
@@ -139,8 +165,234 @@ def _simulate_model_response(
         "hallucinated_apis": hallucinated,
         "token_usage": random.randint(400, 2200),
         "latency_ms": random.uniform(80, 900),
-        "raw": f"[sim-{condition}] score={score:.2f}",
+        "raw": f"[SIMULATED-NOT-EVIDENCE-{condition}] score={score:.2f}",
     }
+
+
+# --- Real inference ---------------------------------------------------------
+
+#: (base_model_name, adapter_path_or_empty) -> (model, tokenizer).
+#: Loading a 1.5B model per task would dominate the measured latency, so each
+#: distinct model/adapter combination is loaded once and reused across tasks.
+_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any]] = {}
+
+
+def require_adapter(adapter_path: Optional[Path], condition: str) -> Path:
+    """Assert that a real trained adapter exists for a tuned condition.
+
+    Raises rather than falling back to the base model or to simulation: a
+    C/D number produced without adapter weights is UNTESTED, and reporting it
+    as a result would be the exact failure this module is meant to prevent.
+    """
+    if adapter_path is None:
+        raise RuntimeError(
+            f"condition {condition} requires a tuned adapter but adapter_path is None. "
+            "Train one with: python -m scripts.run_experiment --repo <path> --real-train"
+        )
+    path = Path(adapter_path)
+    weights = path / "adapter_model.safetensors"
+    if not weights.exists():
+        raise RuntimeError(
+            f"condition {condition} requires a tuned adapter but no weights exist at "
+            f"{weights}. Conditions C/D are UNTESTED without it. "
+            "Train one with: python -m scripts.run_experiment --repo <path> --real-train. "
+            "Refusing to fall back to the base model or to simulation."
+        )
+    return path
+
+
+#: Written by scripts/train_real.py next to the adapter weights.
+ADAPTER_PROVENANCE_FILE = "adapter_provenance.json"
+
+
+def verify_adapter_provenance(
+    adapter_path: Path,
+    expected: Dict[str, Any],
+    allow_unverified: bool = False,
+) -> Dict[str, Any]:
+    """Check that adapter weights belong to THIS run before trusting them.
+
+    require_adapter only proves a file with the right name exists. An adapter
+    left over from another repository, another revision, or another base model
+    loads fine and its C/D metrics would still be labelled "real". Provenance
+    is what makes the "real" label mean something.
+    """
+    record_path = Path(adapter_path) / ADAPTER_PROVENANCE_FILE
+    if not record_path.exists():
+        if allow_unverified:
+            return {"status": "UNVERIFIED", "reason": "no provenance record"}
+        raise RuntimeError(
+            f"adapter at {adapter_path} has no {ADAPTER_PROVENANCE_FILE}, so it "
+            "cannot be shown to belong to this run. It may have been trained on "
+            "another repository, revision, or base model. Re-train with "
+            "--real-train, or pass --allow-unverified-adapter to accept it "
+            "knowing the 'real' label is then unproven."
+        )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    mismatches = {
+        key: {"adapter": record.get(key), "this_run": value}
+        for key, value in expected.items()
+        if record.get(key) != value
+    }
+    if mismatches and not allow_unverified:
+        raise RuntimeError(
+            f"adapter at {adapter_path} was not trained for this run: "
+            f"{json.dumps(mismatches, indent=2)}. Re-train with --real-train, or "
+            "pass --allow-unverified-adapter to accept it anyway."
+        )
+    return {
+        "status": "VERIFIED" if not mismatches else "MISMATCH_ACCEPTED",
+        "record": record,
+        "mismatches": mismatches,
+    }
+
+
+def _load_model(base_model_name: str, adapter_path: Optional[Path]) -> Tuple[Any, Any]:
+    key = (base_model_name, str(adapter_path) if adapter_path else "")
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "real evaluation needs torch + transformers installed "
+            "(pip install -r requirements.txt); refusing to simulate instead"
+        ) from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if torch.cuda.is_available():
+        kwargs["torch_dtype"] = torch.bfloat16
+        kwargs["device_map"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(base_model_name, **kwargs)
+
+    if adapter_path is not None:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, str(adapter_path))
+    model.eval()
+
+    _MODEL_CACHE[key] = (model, tokenizer)
+    return model, tokenizer
+
+
+def clear_model_cache() -> None:
+    """Drop cached models (used by tests and by long multi-model runs)."""
+    _MODEL_CACHE.clear()
+
+
+def real_model_response(
+    task: TaskExample,
+    condition: str,
+    packs_dir: Optional[Path],
+    graph: Optional[DependencyGraph],
+    adapter_path: Optional[Path],
+    base_model_name: str = DEFAULT_BASE_MODEL,
+) -> Dict[str, Any]:
+    """Run the actual model for one task under one condition.
+
+    Conditions A/B use the base model. C/D use base + LoRA adapter and fail
+    loudly when no adapter weights exist. The prompt differs per condition
+    (see src.prompting.build_prompt) — that difference is the experiment.
+    """
+    import torch
+
+    use_adapter = condition in TUNED_CONDITIONS
+    resolved_adapter = require_adapter(adapter_path, condition) if use_adapter else None
+    model, tokenizer = _load_model(base_model_name, resolved_adapter)
+
+    prompt = build_prompt(task, condition, packs_dir, graph if condition == "D" else None)
+    if tokenizer.chat_template:
+        text = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        text = f"{SYSTEM_PROMPT}\n\n{prompt}\n\nAnswer: "
+
+    # Training truncates the prompt from the left so the answer survives
+    # (train_real.encode). Evaluation must do the same: right truncation drops
+    # the tail of the prompt, which holds the answer-schema hint and, for
+    # condition D, the entire graph neighborhood — D would lose its defining
+    # input on any long prompt.
+    tokenizer.truncation_side = "left"
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    prompt_tokens = int(inputs["input_ids"].shape[-1])
+
+    started = time.perf_counter()
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    latency_ms = (time.perf_counter() - started) * 1000
+
+    new_tokens = generated[0][prompt_tokens:]
+    completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    predicted = parse_answer(completion)
+
+    if predicted is None:
+        # Unparseable output is a real failure of the model under this
+        # condition, not an excuse to substitute a score.
+        return {
+            "success": False,
+            "predicted_impacted": [],
+            "hallucinated_apis": 0,
+            "token_usage": prompt_tokens + int(new_tokens.shape[-1]),
+            "latency_ms": latency_ms,
+            "raw": f"[REAL-{condition}] unparseable completion: {completion[:160]!r}",
+            "parse_ok": False,
+        }
+
+    repo_paths = set(known_repo_paths(packs_dir))
+    hallucinated = (
+        sum(1 for path in predicted if path not in repo_paths) if repo_paths else 0
+    )
+    expected = expected_answer_paths(task)
+    if not expected:
+        # evaluate_condition filters these out; reaching here means the filter
+        # regressed, and guessing a score would silently inflate the run.
+        raise RuntimeError(
+            f"task {task.task_id} ({task.task_type}) has no comparable ground-truth "
+            "path list and must not be scored"
+        )
+    hit = bool(set(expected) & set(predicted))
+
+    return {
+        "success": hit,
+        "predicted_impacted": predicted,
+        "hallucinated_apis": hallucinated,
+        "token_usage": prompt_tokens + int(new_tokens.shape[-1]),
+        "latency_ms": latency_ms,
+        "raw": f"[REAL-{condition}] predicted {len(predicted)} paths",
+        "parse_ok": True,
+    }
+
+
+def _answer_leaks_into_context(task: TaskExample) -> bool:
+    """True when the task's own context_files already contain the answer.
+
+    history_tasks builds change-impact context as `changed + related[:8]` while
+    the ground truth is `related[:10]`, so part of the answer is handed to every
+    condition. That task-design issue is out of scope to fix here, but a run
+    should not hide it: affected results are annotated in MetricResult.notes.
+    """
+    expected = set(expected_answer_paths(task))
+    if not expected:
+        return False
+    return bool(expected & set(task.context_files or []))
 
 
 def evaluate_condition(
@@ -149,16 +401,45 @@ def evaluate_condition(
     packs_dir: Optional[Path],
     graph: Optional[DependencyGraph],
     adapter_path: Optional[Path] = None,
+    mode: EvalMode = "simulate",
+    base_model_name: str = DEFAULT_BASE_MODEL,
 ) -> List[MetricResult]:
+    """Score every eval-split task under one condition.
+
+    mode="simulate" (default, backward compatible) runs no model and produces
+    results labelled data_provenance="simulated" — pipeline smoke-test only.
+    mode="real" runs the actual model, and raises for conditions C/D when no
+    trained adapter exists rather than silently degrading to simulation.
+    """
+    if mode not in ("real", "simulate"):
+        raise ValueError(f"mode must be 'real' or 'simulate', got {mode!r}")
+
+    provenance = "real" if mode == "real" else "simulated"
+    if mode == "real" and condition in TUNED_CONDITIONS:
+        # Fail before any task is scored, and before loading torch, so a run
+        # without an adapter dies immediately with an actionable message.
+        require_adapter(adapter_path, condition)
+
     packs_ok = packs_dir is not None and packs_dir.exists()
     graph_ok = graph is not None
     results = []
     for t in tasks:
         if t.split != "eval":
             continue
+        if not is_scoreable(t):
+            # No comparable answer -> excluded, not scored. See is_scoreable.
+            continue
         t0 = time.time()
-        sim = _simulate_model_response(t, condition, packs_ok, graph_ok and condition == "D")
-        latency = (time.time() - t0) * 1000 + sim["latency_ms"]
+        if mode == "real":
+            sim = real_model_response(
+                t, condition, packs_dir, graph, adapter_path, base_model_name
+            )
+            latency = sim["latency_ms"]
+        else:
+            sim = _simulate_model_response(
+                t, condition, packs_ok, graph_ok and condition == "D"
+            )
+            latency = (time.time() - t0) * 1000 + sim["latency_ms"]
 
         gt_impacted = set(t.ground_truth.get("impacted", t.ground_truth.get("tests_to_run", [])))
         pred = set(sim.get("predicted_impacted", []))
@@ -171,12 +452,17 @@ def evaluate_condition(
             0.0 if t.task_type == "cross_file_dependency_reasoning" else -1.0
         )
 
+        notes = sim["raw"]
+        if _answer_leaks_into_context(t):
+            notes += " [WARN: ground-truth paths present in task.context_files]"
+
         results.append(
             MetricResult(
                 task_id=t.task_id,
                 condition=condition,
                 task_type=t.task_type,
                 success=sim["success"],
+                data_provenance=provenance,
                 test_pass_rate=recall if "test" in t.task_type else 0.0,
                 bug_localization_accuracy=max(0.0, bug_acc),
                 impacted_file_recall=recall,
@@ -186,7 +472,7 @@ def evaluate_condition(
                 security_regressions=0,
                 token_usage=sim["token_usage"],
                 latency_ms=latency,
-                notes=sim["raw"],
+                notes=notes,
             )
         )
     return results
@@ -197,15 +483,22 @@ def run_all_conditions(
     packs_dir: Path,
     graph: DependencyGraph,
     adapter_path: Optional[Path] = None,
+    mode: EvalMode = "simulate",
+    base_model_name: str = DEFAULT_BASE_MODEL,
 ) -> Dict[str, List[MetricResult]]:
+    """Run all four conditions. Condition A gets no packs, D alone gets the
+    graph, C/D alone get the adapter — that ladder is the independent
+    variable."""
     out = {}
     for cond in ("A", "B", "C", "D"):
         out[cond] = evaluate_condition(
             eval_tasks,
             cond,
-            packs_dir if cond in ("B", "C", "D") else None,
+            packs_dir,  # A reads source flat; B/C/D read structured packs
             graph if cond == "D" else None,
-            adapter_path if cond in ("C", "D") else None,
+            adapter_path if cond in TUNED_CONDITIONS else None,
+            mode=mode,
+            base_model_name=base_model_name,
         )
     return out
 
@@ -271,15 +564,71 @@ def contamination_audit(
     return report
 
 
-def aggregate_metrics(results_by_cond: Dict[str, List[MetricResult]]) -> Dict[str, Any]:
+def condition_provenance(rows: List[MetricResult]) -> str:
+    """"real", "simulated", "mixed", or "none" for a condition's results."""
+    labels = {r.data_provenance for r in rows}
+    if not labels:
+        return "none"
+    if len(labels) == 1:
+        return labels.pop()
+    return "mixed"
+
+
+def run_provenance(summary: Dict[str, Any]) -> str:
+    """Provenance of a whole run. Anything short of every condition being
+    "real" is reported as not-real so a run cannot be quoted as evidence on
+    the strength of its one real condition."""
+    labels = {s.get("data_provenance", "none") for s in summary.values()}
+    labels.discard("none")
+    if not labels:
+        return "none"
+    if labels == {"real"}:
+        return "real"
+    if labels == {"simulated"}:
+        return "simulated"
+    return "mixed"
+
+
+def scoreability_report(eval_tasks: List[TaskExample]) -> Dict[str, Any]:
+    """Which eval tasks can be scored, and which were excluded and why.
+
+    Excluded tasks are not failures and not successes — they are outside what
+    impacted-file overlap can measure. Reporting the count keeps a shrinking
+    eval set visible instead of quietly changing what the headline rate means.
+    """
+    scoreable, excluded = [], []
+    for t in eval_tasks:
+        if t.split != "eval":
+            continue
+        (scoreable if is_scoreable(t) else excluded).append(t)
+    by_type: Dict[str, int] = {}
+    for t in excluded:
+        by_type[t.task_type] = by_type.get(t.task_type, 0) + 1
+    return {
+        "eval_tasks_total": len(scoreable) + len(excluded),
+        "scoreable": len(scoreable),
+        "excluded": len(excluded),
+        "excluded_by_task_type": by_type,
+        "reason": (
+            "ground truth has no comparable file-path list; scoring these by "
+            "impacted-file overlap would count any non-empty answer as correct"
+        ),
+    }
+
+
+def aggregate_metrics(
+    results_by_cond: Dict[str, List[MetricResult]],
+    scoreability: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     summary = {}
     for cond, rows in results_by_cond.items():
         if not rows:
-            summary[cond] = {"n": 0}
+            summary[cond] = {"n": 0, "data_provenance": "none"}
             continue
         n = len(rows)
         summary[cond] = {
             "n": n,
+            "data_provenance": condition_provenance(rows),
             "task_success_rate": sum(1 for r in rows if r.success) / n,
             "mean_impacted_file_recall": sum(r.impacted_file_recall for r in rows) / n,
             "mean_hallucinated_apis": sum(r.hallucinated_api_count for r in rows) / n,
@@ -292,4 +641,6 @@ def aggregate_metrics(results_by_cond: Dict[str, List[MetricResult]]) -> Dict[st
             ),
             "condition_label": CONDITIONS[cond],
         }
+        if scoreability is not None:
+            summary[cond]["unscoreable_excluded"] = scoreability["excluded"]
     return summary

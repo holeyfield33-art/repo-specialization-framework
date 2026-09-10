@@ -123,6 +123,10 @@ def generate_file_packs(
     index = {
         "repo": manifest.repo_name,
         "graph_version": manifest.graph_version,
+        # Packs hold the file state at this commit. Training on a historical
+        # task with packs built here means the prompt carries post-cutoff
+        # state; train_real checks for that and records it.
+        "head_sha": manifest.head_sha,
         "pack_count": len(packs),
         "packs": [{"path": p.path, "source_sha": p.source_sha, "pack_sha": p.pack_sha} for p in packs],
     }

@@ -9,13 +9,23 @@ Usage:
 Produces all required artifacts:
   repository manifest, file packs, dependency graph,
   train/val/eval manifests, contamination report,
-  QLoRA config, (adapter placeholder), evaluation results, dashboard.
+  QLoRA config, adapter, evaluation results, dashboard.
+
+Two modes, and the difference matters:
+  default (no flags)                  no model runs; results are labelled
+                                      data_provenance="simulated" and are a
+                                      pipeline smoke test, not evidence.
+  --real-train --eval-mode real       trains a real LoRA adapter and evaluates
+                                      with real forward passes; results are
+                                      labelled data_provenance="real".
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,15 +37,26 @@ from src.ingestion import ingest_repository, save_manifest, manifest_to_dict
 from src.graph import build_dependency_graph
 from src.file_packs import generate_file_packs
 from src.history_tasks import generate_tasks_from_history, write_splits
-from src.qlora_config import QLoRAHyperParams, TRAIN_SCRIPT
+from src.qlora_config import QLoRAHyperParams
 from src.evaluation import (
     run_all_conditions,
     contamination_audit,
     aggregate_metrics,
     deterministic_verify,
+    run_provenance,
+    scoreability_report,
+    verify_adapter_provenance,
     CONDITIONS,
 )
 from src.dashboard import build_dashboard, write_streamlit_app
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def main() -> None:
@@ -49,6 +70,33 @@ def main() -> None:
     parser.add_argument("--model", choices=["qwen", "smol"], default="qwen")
     parser.add_argument("--out", type=str, default=str(ROOT / "results"))
     parser.add_argument("--dry-train", action="store_true", default=True)
+    parser.add_argument(
+        "--real-train",
+        action="store_true",
+        default=False,
+        help="Actually train a LoRA adapter via scripts/train_real.py "
+             "instead of writing a NOT_TRAINED marker.",
+    )
+    parser.add_argument(
+        "--train-steps",
+        type=int,
+        default=200,
+        help="Optimizer steps for --real-train.",
+    )
+    parser.add_argument(
+        "--allow-unverified-adapter",
+        action="store_true",
+        default=False,
+        help="Accept adapter weights that cannot be shown to belong to this run. "
+             "The 'real' label on conditions C/D is then unproven.",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        choices=["real", "simulate"],
+        default="simulate",
+        help="'real' runs the model for every condition; 'simulate' runs no "
+             "model and produces results explicitly labelled as non-evidence.",
+    )
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -88,19 +136,81 @@ def main() -> None:
     hp = QLoRAHyperParams.for_model(args.model)
     hp.output_dir = str(out / "adapters" / f"{args.model}-repo-qlora")
     hp.save(out / "qlora_config.yaml")
-    (out / "train_qlora.py").write_text(TRAIN_SCRIPT)
     adapter_marker = Path(hp.output_dir)
-    adapter_marker.mkdir(parents=True, exist_ok=True)
-    (adapter_marker / "ADAPTER_PLACEHOLDER.txt").write_text(
-        "Adapter weights would be written here after GPU QLoRA training.\n"
-        "Facts remain in file packs + graph; adapter learns conventions/patterns only.\n"
-        f"Config: {args.model} r={hp.lora_r} alpha={hp.lora_alpha} seq={hp.max_seq_length}\n"
-    )
     print(f"  model={hp.model_name_or_path} effective_batch={hp.effective_batch_size()}")
 
-    print("=== 7-8. Evaluation (4 conditions) ===")
-    results_by_cond = run_all_conditions(eval_tasks, packs_dir, graph, adapter_marker)
-    summary = aggregate_metrics(results_by_cond)
+    if args.real_train:
+        print(f"=== 6b. Real LoRA training ({args.train_steps} steps) ===")
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "train_real.py"),
+                "--train_jsonl", str(split_paths["train"]),
+                "--model", hp.model_name_or_path,
+                "--out", str(adapter_marker),
+                "--steps", str(args.train_steps),
+                "--packs_dir", str(packs_dir),
+                "--repo_head", str(manifest.head_sha or ""),
+                "--lora_r", str(hp.lora_r),
+                "--lora_alpha", str(hp.lora_alpha),
+                "--lr", str(hp.learning_rate),
+                "--max_seq_length", str(hp.max_seq_length),
+                "--seed", str(hp.seed),
+            ],
+            check=True,
+        )
+    else:
+        adapter_marker.mkdir(parents=True, exist_ok=True)
+        (adapter_marker / "NOT_TRAINED.txt").write_text(
+            "Run with --real-train to produce a real adapter. "
+            "No adapter exists at this path; conditions C/D are UNTESTED, "
+            "not merely untuned.\n"
+        )
+
+    adapter_weights = adapter_marker / "adapter_model.safetensors"
+    if args.eval_mode == "real" and not adapter_weights.exists():
+        parser.error(
+            f"--eval-mode real requires trained adapter weights at {adapter_weights}, "
+            "which do not exist. Re-run with --real-train (or point --out at a run "
+            "that already trained one). Refusing to fall back to simulation: "
+            "conditions C/D would be UNTESTED, not untuned."
+        )
+
+    adapter_check = None
+    if args.eval_mode == "real":
+        # Weights with the right filename are not proof of anything. An adapter
+        # from another repo, revision or base model would load fine and its
+        # C/D numbers would still be labelled "real".
+        try:
+            adapter_check = verify_adapter_provenance(
+                adapter_marker,
+                {
+                    "base_model": hp.model_name_or_path,
+                    "repo_head_sha": str(manifest.head_sha or ""),
+                    "train_split_sha256": _sha256_file(split_paths["train"]),
+                },
+                allow_unverified=args.allow_unverified_adapter,
+            )
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        print(f"  adapter provenance: {adapter_check['status']}")
+
+    print(f"=== 7-8. Evaluation (4 conditions, mode={args.eval_mode}) ===")
+    scoreability = scoreability_report(eval_tasks)
+    if scoreability["excluded"]:
+        print(f"  excluding {scoreability['excluded']}/{scoreability['eval_tasks_total']} "
+              f"eval tasks with no comparable answer: "
+              f"{scoreability['excluded_by_task_type']}")
+    results_by_cond = run_all_conditions(
+        eval_tasks,
+        packs_dir,
+        graph,
+        adapter_marker,
+        mode=args.eval_mode,
+        base_model_name=hp.model_name_or_path,
+    )
+    summary = aggregate_metrics(results_by_cond, scoreability)
+    provenance = run_provenance(summary)
     with open(out / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
     with open(out / "metrics_raw.json", "w") as fh:
@@ -110,9 +220,12 @@ def main() -> None:
             indent=2,
         )
     for c, s in summary.items():
-        print(f"  {c}: success={s.get('task_success_rate', 0):.1%} "
+        print(f"  {c}: [{s.get('data_provenance', 'none')}] "
+              f"success={s.get('task_success_rate', 0):.1%} "
               f"recall={s.get('mean_impacted_file_recall', 0):.1%} "
               f"| {s.get('condition_label', '')[:50]}")
+    if provenance != "real":
+        print("  *** SIMULATED RESULTS - not experimental evidence. No model ran. ***")
 
     print("=== 9. Deterministic verification gate ===")
     sample_pack = packs[0] if packs else None
@@ -141,11 +254,16 @@ def main() -> None:
 
     print("=== 11. Dashboard ===")
     examples = []
+    by_task = {}
+    for cond in ("A", "D"):
+        for row in results_by_cond.get(cond, []):
+            by_task.setdefault(row.task_id, {})[cond] = row
     for t in eval_tasks[:4]:
+        pair = by_task.get(t.task_id, {})
         examples.append({
             "task_id": t.task_id,
-            "A": "lower confidence / missing edges (sim)",
-            "D": "higher recall via impact neighborhood (sim)",
+            "A": pair["A"].notes if "A" in pair else "(no result)",
+            "D": pair["D"].notes if "D" in pair else "(no result)",
         })
     dash = build_dashboard(
         summary,
@@ -177,6 +295,12 @@ def main() -> None:
             "dashboard": str(dash),
         },
         "conditions": CONDITIONS,
+        "data_provenance": provenance,
+        "scoreability": scoreability,
+        "adapter_provenance_check": adapter_check,
+        "eval_mode": args.eval_mode,
+        "real_train": args.real_train,
+        "adapter_trained": adapter_weights.exists(),
         "summary": summary,
         "contamination_status": contam["status"],
         "gate_status": gate.status,
@@ -186,6 +310,12 @@ def main() -> None:
 
     print("\n=== DONE ===")
     print(f"All artifacts under: {out}")
+    print(f"Run data_provenance: {provenance}")
+    if provenance != "real":
+        print(
+            "These numbers are NOT experimental evidence. Re-run with "
+            "--real-train --eval-mode real to measure the actual question."
+        )
     print("Open results/dashboard.html in a browser for the comparison view.")
 
 
