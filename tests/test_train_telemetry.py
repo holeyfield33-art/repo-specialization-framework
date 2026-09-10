@@ -115,7 +115,9 @@ def test_hook_records_real_gradients_on_a_backward_pass(tiny_peft_model):
         ids = torch.randint(0, 128, (1, 16))
         out = tiny_peft_model(input_ids=ids, labels=ids)
         out.loss.backward()
-        tele = hook.collect(step=0, loss=float(out.loss), compute_ms=1.0, task_ids=["t"])
+        tele = hook.collect(
+            step=0, loss=float(out.loss.detach()), compute_ms=1.0, task_ids=["t"]
+        )
         assert tele.weight_grad_norms, "no weight gradients captured"
         assert tele.grad_norms, "no block gradients captured"
         assert all(v >= 0 for v in tele.weight_grad_norms.values())
@@ -205,26 +207,78 @@ def test_build_examples_raises_when_nothing_is_supervisable():
         build_examples(tasks, packs_dir=None)
 
 
-def test_encode_masks_the_prompt_so_loss_is_on_the_answer_only():
-    from transformers import AutoTokenizer
+@pytest.fixture(scope="module")
+def offline_tokenizer():
+    """A real tokenizer built in-process — no network, no model download, so
+    the suite cannot go red because the HF Hub had a bad afternoon."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
 
-    tok = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
-    ids, labels = encode(tok, "some long prompt text", '{"impacted": ["a.js"]}', 128)
+    words = ["<unk>", "</s>", "<pad>", "some", "long", "prompt", "text", "word",
+             "impacted", "a", "js", "{", "}", "[", "]", '"', ":", ".", ","]
+    inner = Tokenizer(models.WordLevel(
+        vocab={w: i for i, w in enumerate(words)}, unk_token="<unk>"
+    ))
+    inner.pre_tokenizer = pre_tokenizers.Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=inner, unk_token="<unk>", eos_token="</s>", pad_token="<pad>"
+    )
+
+
+@pytest.fixture(scope="module")
+def chat_tokenizer(offline_tokenizer):
+    """Same tokenizer with a chat template, to cover encode()'s other branch."""
+    import copy
+
+    tok = copy.deepcopy(offline_tokenizer)
+    tok.chat_template = (
+        "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+    )
+    return tok
+
+
+def _assert_masking_is_correct(ids, labels):
     assert ids.shape == labels.shape
     masked = (labels == -100).sum().item()
     assert masked > 0, "prompt tokens must be masked out of the loss"
     assert masked < labels.numel(), "the answer must remain supervised"
-    # the unmasked tail must be exactly the target tokens
+    # every supervised position must equal the input token at that position
     assert (labels[labels != -100] == ids[labels != -100]).all()
+    # the mask must be a prefix: prompt first, answer last, no holes
+    flat = labels[0].tolist()
+    first_supervised = next(i for i, v in enumerate(flat) if v != -100)
+    assert all(v != -100 for v in flat[first_supervised:]), "mask is not a clean prefix"
 
 
-def test_encode_keeps_the_answer_when_the_prompt_overflows():
-    from transformers import AutoTokenizer
+def test_encode_masks_the_prompt_so_loss_is_on_the_answer_only(offline_tokenizer):
+    ids, labels = encode(
+        offline_tokenizer, "some long prompt text", '{"impacted": ["a.js"]}', 128
+    )
+    _assert_masking_is_correct(ids, labels)
 
-    tok = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
-    ids, labels = encode(tok, "word " * 5000, '{"impacted": ["a.js"]}', 64)
+
+def test_encode_masks_correctly_with_a_chat_template(chat_tokenizer):
+    assert chat_tokenizer.chat_template, "fixture must exercise the template branch"
+    ids, labels = encode(
+        chat_tokenizer, "some long prompt text", '{"impacted": ["a.js"]}', 128
+    )
+    _assert_masking_is_correct(ids, labels)
+
+
+def test_encode_keeps_the_answer_when_the_prompt_overflows(offline_tokenizer):
+    ids, labels = encode(offline_tokenizer, "word " * 5000, '{"impacted": ["a.js"]}', 64)
     assert ids.shape[-1] <= 64
     assert (labels != -100).sum().item() > 0, "answer was truncated away"
+
+
+def test_encode_never_exceeds_the_sequence_budget(offline_tokenizer):
+    for budget in (8, 16, 64, 256):
+        ids, labels = encode(
+            offline_tokenizer, "word " * 500, '{"impacted": ["a.js"]}', budget
+        )
+        assert ids.shape[-1] <= budget, f"overflowed budget {budget}"
+        assert ids.shape == labels.shape
 
 
 # --- backend selection -------------------------------------------------------
