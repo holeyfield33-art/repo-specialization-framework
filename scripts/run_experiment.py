@@ -135,7 +135,7 @@ def main() -> None:
                 "--lora_r", str(hp.lora_r),
                 "--lora_alpha", str(hp.lora_alpha),
                 "--lr", str(hp.learning_rate),
-                "--max_seq_len", str(hp.max_seq_length),
+                "--max_seq_length", str(hp.max_seq_length),
                 "--seed", str(hp.seed),
             ],
             check=True,

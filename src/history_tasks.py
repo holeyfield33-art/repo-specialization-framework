@@ -3,6 +3,12 @@
 
 Primary split unit = change family. Temporal preference: train on earlier,
 eval on later. No leakage of future state.
+
+Task context must not contain the task's own answer. `context_files` carries
+only the evidence a solver is given (the changed/seed files); the files it must
+predict live in `ground_truth` alone. Conditions reach the answer through their
+own context ladder (packs for B/C, the dependency graph for D) or not at all.
+tests/test_task_integrity.py enforces this on every generated task.
 Tasks prioritized:
   bug localization, root-cause, change-impact, patch generation,
   test-impact, cross-file dependency reasoning, code review,
@@ -20,6 +26,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .ingestion import ChangeFamily, RepoManifest
 from .graph import DependencyGraph
+from .prompting import expected_answer_paths
 
 
 @dataclass
@@ -34,6 +41,45 @@ class TaskExample:
     evidence: List[str]  # provenance strings
     split: str = "train"  # train | val | eval
     difficulty: str = "medium"
+
+
+#: Task types where supplying the answer set IS the task: bug localization
+#: asks which of these candidates is the culprit, not which files exist. Every
+#: other type must keep its answer out of the prompt.
+CANDIDATE_SET_TASK_TYPES = {"bug_localization"}
+
+
+def enforce_context_answer_disjoint(
+    tasks: List["TaskExample"],
+) -> Tuple[List["TaskExample"], Dict[str, Any]]:
+    """Strip ground-truth paths out of every task's context_files.
+
+    Applied to all tasks at generation time so the invariant holds by
+    construction rather than per task type. A task whose context is entirely
+    consumed by this had no evidence beyond its own answer and is dropped: an
+    unanswerable task scored across four conditions is noise in every one.
+
+    Returns the surviving tasks plus a machine-readable report.
+    """
+    kept: List["TaskExample"] = []
+    report: Dict[str, Any] = {"stripped": [], "dropped": []}
+    for t in tasks:
+        if t.task_type in CANDIDATE_SET_TASK_TYPES:
+            kept.append(t)
+            continue
+        answer = set(expected_answer_paths(t))
+        if not answer:
+            kept.append(t)
+            continue
+        removed = [f for f in t.context_files if f in answer]
+        if removed:
+            t.context_files = [f for f in t.context_files if f not in answer]
+            report["stripped"].append({"task_id": t.task_id, "removed": removed})
+        if not t.context_files:
+            report["dropped"].append({"task_id": t.task_id, "reason": "no evidence left"})
+            continue
+        kept.append(t)
+    return kept, report
 
 
 TASK_TYPES = [
@@ -108,7 +154,11 @@ def generate_tasks_from_history(
                     f"list the files most likely to be impacted (callers, callees, tests). "
                     f"Changed: {changed[:5]}. Use only repository structure evidence."
                 ),
-                context_files=changed + related[:8],
+                # Only the CHANGED files. `related` is the answer: including it
+                # here would hand every condition the ground truth and make the
+                # A/B/C/D comparison meaningless. Condition D reaches `related`
+                # through the dependency graph — that is D's whole advantage.
+                context_files=changed,
                 ground_truth={
                     "impacted": related[:10],
                     "seeds": changed,
@@ -135,7 +185,8 @@ def generate_tasks_from_history(
                     f"Which tests should be re-run after changes to {changed[:3]}? "
                     "Answer with paths only; justify from TEST edges."
                 ),
-                context_files=changed + tests[:5],
+                # Only the changed files; `tests` is the answer.
+                context_files=changed,
                 ground_truth={"tests_to_run": tests},
                 evidence=[f"test-heuristic:{t}" for t in tests[:5]],
                 split=split,
@@ -200,6 +251,9 @@ def generate_tasks_from_history(
                         f"Localize the bug addressed by commit {fam.root_commit[:12]}. "
                         f"Message: {msg[:180]}. Name the primary file and symbol if possible."
                     ),
+                    # Deliberate overlap: bug localization is a pick-from-candidates
+                    # task, so the candidate set is the input, not a leak. The
+                    # answer is which of them, not which files exist.
                     context_files=changed[:5],
                     ground_truth={"primary_files": changed[:2], "message": msg},
                     evidence=[f"commit:{fam.root_commit}"],
@@ -244,7 +298,8 @@ def generate_tasks_from_history(
                         f"Predict impact neighborhood for a hypothetical change to {path}. "
                         "List likely callers, callees, and tests."
                     ),
-                    context_files=[path] + related[:5],
+                    # Only the seed file; `related` is the answer.
+                    context_files=[path],
                     ground_truth={"impacted": related, "seeds": [path]},
                     evidence=[f"graph:{graph.version}"],
                     split="eval",
@@ -252,6 +307,7 @@ def generate_tasks_from_history(
                 )
             )
 
+    tasks, _ = enforce_context_answer_disjoint(tasks)
     return tasks
 
 

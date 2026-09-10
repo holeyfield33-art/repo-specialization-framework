@@ -94,9 +94,22 @@ python scripts/train_real.py \
   --steps 200
 ```
 
-Runs on CPU (slowly, fp32) or GPU. Add `--load_in_4bit` for QLoRA on CUDA. It writes
-real `adapter_model.safetensors` plus `training_trace.json` (loss curve and per-layer
-gradient norms), and refuses to report success if no weights were written.
+The backend is auto-selected: CUDA + bitsandbytes runs real 4-bit QLoRA, CUDA alone
+runs bf16 LoRA, CPU falls back to fp32 LoRA (same adapter math, slower, more RAM).
+`--no_4bit` forces full precision. It refuses to report success if no weights were
+written, and fails loudly on a missing split rather than substituting synthetic data.
+
+**Training telemetry.** Every step records real block-level `dLoss/d(output)` and
+`dLoss/dW` norms for all 7 adapted projections in every layer, keyed
+`<layer>.<projection>` so a norm traces back to the layer it came from:
+
+- `train_telemetry.jsonl` — one record per step
+- `training_trace.json` — loss curve plus a `telemetry_summary` naming which
+  projections moved and which stayed quiet
+
+This is the evidence for whether tuning does anything condition B does not. If
+`layers_moved` is 0, or `quiet_layers` is long, conditions C/D should not be
+expected to differ from A/B — and that is a real finding, not a bug to hide.
 
 Without `--real-train` the runner writes `NOT_TRAINED.txt` into the adapter directory
 instead — a marker, not an adapter. Conditions C/D are then UNTESTED, not untuned.
@@ -123,7 +136,7 @@ repo-specialization-framework/
 │   └── dashboard.py      # §11
 ├── scripts/
 │   ├── run_experiment.py # end-to-end
-│   └── train_real.py     # real LoRA training (writes real adapter weights)
+│   └── train_real.py     # real LoRA training + gradient telemetry
 ├── tests/
 ├── configs/
 ├── data/                 # intermediate (created at runtime)
